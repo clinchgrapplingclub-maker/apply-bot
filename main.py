@@ -19,6 +19,7 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # NEW 🔥
 DEMOTE_ROLE_ID = int(os.getenv("DEMOTE_ROLE_ID"))
+DEMOTE_RANK_ID = int(os.getenv("DEMOTE_RANK_ID"))
 
 # Temporary in-memory data
 applied_users = set()
@@ -91,10 +92,11 @@ def set_rank(user_id):
 
 def rank_down(user_id):
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}"
-    json_data = {"roleId": 1}
+    json_data = {"roleId": DEMOTE_RANK_ID}  # UPDATED 🔥
     response = patch_with_csrf(url, json_data)
     print(f"[DEBUG] rank_down response: {response.status_code} - {response.text}")
     return response.status_code == 200
+
 
 # /turfapply
 @bot.slash_command(name="turfapply", description="Apply for Turf by verifying your Roblox username.")
