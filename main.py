@@ -25,13 +25,11 @@ DEMOTE_RANK_ID = int(os.getenv("DEMOTE_RANK_ID"))
 applied_users = set()
 user_links = {}
 
-# Roblox API headers
 roblox_headers = {
     'Content-Type': 'application/json',
     'Cookie': f'.ROBLOSECURITY={ROBLOX_COOKIE}'
 }
 
-# PostgreSQL
 def get_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -53,11 +51,13 @@ def save_application(discord_id, roblox_id):
 def patch_with_csrf(url, json_data):
     headers = roblox_headers.copy()
     response = requests.patch(url, headers=headers, json=json_data)
+
     if response.status_code == 403:
         token = response.headers.get('x-csrf-token')
         if token:
             headers['X-CSRF-TOKEN'] = token
             response = requests.patch(url, headers=headers, json=json_data)
+
     return response
 
 def get_user_id(username):
@@ -87,18 +87,17 @@ def set_rank(user_id):
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}"
     json_data = {"roleId": RANK_ID}
     response = patch_with_csrf(url, json_data)
-    print(f"[DEBUG] set_rank response: {response.status_code} - {response.text}")
     return response.status_code == 200
 
+# 🔥 FIXED DEMOTE SYSTEM
 def rank_down(user_id):
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}"
-    json_data = {"roleId": DEMOTE_RANK_ID}  # UPDATED 🔥
+    json_data = {"roleId": DEMOTE_RANK_ID}  # CHANGED ✔
     response = patch_with_csrf(url, json_data)
     print(f"[DEBUG] rank_down response: {response.status_code} - {response.text}")
     return response.status_code == 200
 
 
-# /turfapply
 @bot.slash_command(name="turfapply", description="Apply for Turf by verifying your Roblox username.")
 async def turfapply(ctx, username: str):
 
@@ -141,7 +140,6 @@ async def turfapply(ctx, username: str):
         await ctx.respond("Error ranking user", ephemeral=True)
 
 
-# ROLE LOSS → AUTO DEMOTE
 @bot.event
 async def on_member_update(before, after):
 
@@ -157,7 +155,6 @@ async def on_member_update(before, after):
                 print(f"{after} auto demoted")
 
 
-# NEW 🔥 /demote command
 @bot.slash_command(name="demote", description="Manually demote a user in Roblox group")
 async def demote(ctx, username: str):
 
