@@ -89,15 +89,15 @@ def set_rank(user_id):
     response = patch_with_csrf(url, json_data)
     return response.status_code == 200
 
-# 🔥 FIXED DEMOTE SYSTEM
 def rank_down(user_id):
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}"
-    json_data = {"roleId": DEMOTE_RANK_ID}  # CHANGED ✔
+    json_data = {"roleId": DEMOTE_RANK_ID}
     response = patch_with_csrf(url, json_data)
     print(f"[DEBUG] rank_down response: {response.status_code} - {response.text}")
     return response.status_code == 200
 
 
+# /turfapply
 @bot.slash_command(name="turfapply", description="Apply for Turf by verifying your Roblox username.")
 async def turfapply(ctx, username: str):
 
@@ -140,6 +140,7 @@ async def turfapply(ctx, username: str):
         await ctx.respond("Error ranking user", ephemeral=True)
 
 
+# 🔥 FIXED AUTO DEMOTE (NO ROLE WIPE BUG)
 @bot.event
 async def on_member_update(before, after):
 
@@ -151,10 +152,15 @@ async def on_member_update(before, after):
         if discord_id in user_links:
             roblox_id = user_links[discord_id]
 
-            if rank_down(roblox_id):
-                print(f"{after} auto demoted")
+            # Roblox demote ONLY
+            rank_down(roblox_id)
+
+            print(f"[INFO] {after} auto demoted in Roblox")
+
+        # IMPORTANT: NO mass role removal anymore
 
 
+# /demote command
 @bot.slash_command(name="demote", description="Manually demote a user in Roblox group")
 async def demote(ctx, username: str):
 
