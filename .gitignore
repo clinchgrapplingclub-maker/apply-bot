@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Environment / secrets
+.env
+
+# OS/system files
+.DS_Store
+Thumbs.db
+
+# VSCode settings (om du använder det)
+.vscode/
+
+# Railway build cache (om någon)
+.railway/
