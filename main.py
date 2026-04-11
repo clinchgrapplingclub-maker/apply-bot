@@ -8,7 +8,7 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Load environment variables (from Railway secrets)
+# Load environment variables
 DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 ALLOWED_ROLE_ID = int(os.getenv("ALLOWED_ROLE_ID"))
 ROBLOX_COOKIE = os.getenv("ROBLOX_COOKIE")
@@ -17,11 +17,10 @@ RANK_ID = int(os.getenv("RANK_1"))
 RANK_NAME = "Full Access"
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# NEW 🔥
 DEMOTE_ROLE_ID = int(os.getenv("DEMOTE_ROLE_ID"))
 DEMOTE_RANK_ID = int(os.getenv("DEMOTE_RANK_ID"))
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
-# Temporary in-memory data
 applied_users = set()
 user_links = {}
 
@@ -46,6 +45,13 @@ def save_application(discord_id, roblox_id):
                 "INSERT INTO applications (discord_id, roblox_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 (discord_id, roblox_id)
             )
+            conn.commit()
+
+# NEW RESET FUNCTION
+def reset_application(discord_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM applications WHERE discord_id = %s", (discord_id,))
             conn.commit()
 
 def patch_with_csrf(url, json_data):
@@ -93,40 +99,68 @@ def rank_down(user_id):
     url = f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}"
     json_data = {"roleId": DEMOTE_RANK_ID}
     response = patch_with_csrf(url, json_data)
-    print(f"[DEBUG] rank_down response: {response.status_code} - {response.text}")
     return response.status_code == 200
+
+# LOG FUNCTION
+async def send_log(guild, embed):
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        await channel.send(embed=embed)
+
+def add_footer(embed):
+    embed.set_footer(text="Designed And Created By Murda")
+    return embed
 
 
 # /turfapply
-@bot.slash_command(name="turfapply", description="Apply for Turf by verifying your Roblox username.")
+@bot.slash_command(name="turfapply", description="Apply for Turf")
 async def turfapply(ctx, username: str):
 
     member = ctx.author
 
     if ALLOWED_ROLE_ID not in [role.id for role in member.roles]:
-        await ctx.respond("Access Denied", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Access Denied",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     if has_applied(member.id):
-        await ctx.respond("Already applied", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="⚠️ Already Applied",
+            color=discord.Color.orange()
+        )), ephemeral=True)
         return
 
     user_id = get_user_id(username)
     if not user_id:
-        await ctx.respond("User not found", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ User Not Found",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     profile = get_user_profile(user_id)
     if not profile:
-        await ctx.respond("Error", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Error fetching profile",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     if "fl13" not in profile.get("displayName", "").lower():
-        await ctx.respond("Invalid display name", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Invalid Display Name",
+            description="Must contain 'fl13'",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     if not is_in_group(user_id):
-        await ctx.respond("Not in group", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Not in Group",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     if set_rank(user_id):
@@ -134,53 +168,100 @@ async def turfapply(ctx, username: str):
         user_links[member.id] = user_id
         save_application(member.id, user_id)
 
-        await ctx.respond(f"Ranked to {RANK_NAME}")
+        embed = add_footer(discord.Embed(
+            title="✅ Application Approved",
+            description=f"Ranked to **{RANK_NAME}**",
+            color=discord.Color.green()
+        ))
+        await ctx.respond(embed=embed)
+
+        await send_log(ctx.guild, embed)
 
     else:
-        await ctx.respond("Error ranking user", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Failed to rank user",
+            color=discord.Color.red()
+        )), ephemeral=True)
 
 
-# 🔥 FIXED AUTO DEMOTE (NO ROLE WIPE BUG)
+# /reset
+@bot.slash_command(name="reset", description="Reset a user's application")
+async def reset(ctx, member: discord.Member):
+
+    if ALLOWED_ROLE_ID not in [role.id for role in ctx.author.roles]:
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ No Permission",
+            color=discord.Color.red()
+        )), ephemeral=True)
+        return
+
+    reset_application(member.id)
+    applied_users.discard(member.id)
+    user_links.pop(member.id, None)
+
+    embed = add_footer(discord.Embed(
+        title="🔄 Application Reset",
+        description=f"{member.mention} can now apply again.",
+        color=discord.Color.blue()
+    ))
+
+    await ctx.respond(embed=embed)
+    await send_log(ctx.guild, embed)
+
+
+# AUTO DEMOTE
 @bot.event
 async def on_member_update(before, after):
 
     lost_role = ALLOWED_ROLE_ID in [r.id for r in before.roles] and ALLOWED_ROLE_ID not in [r.id for r in after.roles]
 
     if lost_role:
-        discord_id = after.id
-
-        if discord_id in user_links:
-            roblox_id = user_links[discord_id]
-
-            # Roblox demote ONLY
+        if after.id in user_links:
+            roblox_id = user_links[after.id]
             rank_down(roblox_id)
 
-            print(f"[INFO] {after} auto demoted in Roblox")
+            await send_log(after.guild, add_footer(discord.Embed(
+                title="📉 Auto Demote",
+                description=f"{after} lost access and was demoted",
+                color=discord.Color.orange()
+            )))
 
-        # IMPORTANT: NO mass role removal anymore
 
-
-# /demote command
-@bot.slash_command(name="demote", description="Manually demote a user in Roblox group")
+# /demote
+@bot.slash_command(name="demote", description="Demote a user")
 async def demote(ctx, username: str):
 
-    member = ctx.author
-
-    if DEMOTE_ROLE_ID not in [role.id for role in member.roles]:
-        await ctx.respond("No permission", ephemeral=True)
+    if DEMOTE_ROLE_ID not in [role.id for role in ctx.author.roles]:
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ No Permission",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     user_id = get_user_id(username)
 
     if not user_id:
-        await ctx.respond("User not found", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ User Not Found",
+            color=discord.Color.red()
+        )), ephemeral=True)
         return
 
     if rank_down(user_id):
-        await ctx.respond(f"{username} demoted")
+        embed = add_footer(discord.Embed(
+            title="📉 User Demoted",
+            description=f"{username} has been demoted",
+            color=discord.Color.orange()
+        ))
+        await ctx.respond(embed=embed)
+
+        await send_log(ctx.guild, embed)
 
     else:
-        await ctx.respond("Failed to demote", ephemeral=True)
+        await ctx.respond(embed=add_footer(discord.Embed(
+            title="❌ Failed to demote",
+            color=discord.Color.red()
+        )), ephemeral=True)
 
 
 @bot.event
