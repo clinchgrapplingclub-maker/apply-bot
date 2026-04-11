@@ -138,62 +138,39 @@ async def turfapply(ctx, username: str):
     member = ctx.author
 
     if not has_role(member, ALLOWED_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ Access Denied", "You are missing the required role.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ Access Denied", "Missing role.", discord.Color.red()))
 
     if has_applied(member.id):
-        return await ctx.respond(
-            embed=embed("⚠️ Already Applied", "You already submitted an application.", discord.Color.orange())
-        )
+        return await ctx.respond(embed=embed("⚠️ Already Applied", "You already applied.", discord.Color.orange()))
 
     user_id = get_user_id(username)
 
     if not user_id:
-        return await ctx.respond(
-            embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red()))
 
     profile = get_user_profile(user_id)
 
     if not profile:
-        return await ctx.respond(
-            embed=embed("❌ Error", "Could not fetch Roblox profile.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ Error", "Could not fetch profile.", discord.Color.red()))
 
-    display = profile.get("displayName", "").lower()
-
-    if "fl13" not in display:
-        return await ctx.respond(
-            embed=embed(
-                "❌ Invalid Display Name",
-                "Your Roblox display must contain 'fl13'.",
-                discord.Color.red()
-            )
-        )
+    if "fl13" not in profile.get("displayName", "").lower():
+        return await ctx.respond(embed=embed("❌ Invalid Display Name", "Your Roblox display must contain 'fl13'.", discord.Color.red()))
 
     if not is_in_group(user_id):
-        return await ctx.respond(
-            embed=embed("❌ Not In Group", "You must already be in the Roblox group.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ Not In Group", "You must be in the Roblox group.", discord.Color.red()))
 
     if set_rank(user_id):
+
         user_links[member.id] = user_id
         save_application(member.id, user_id)
 
-        await ctx.respond(embed=embed("✅ Accepted", "You have been ranked successfully.", discord.Color.green()))
+        await ctx.respond(embed=embed("✅ Accepted", "You have been ranked!", discord.Color.green()))
 
         await send_dm(member, embed(
             "🎉 Welcome To The Turf",
-            "You've been successfully ranked in the Turf!",
+            "You've been successfully ranked!",
             discord.Color.green()
         ))
-
-        await send_log(ctx.guild,
-            "🟢 APPLICATION APPROVED",
-            f"Discord: {member} ({member.id})\nRoblox ID: {user_id}\nUsername: {username}",
-            discord.Color.green()
-        )
 
 # ---------------- /demote ----------------
 @bot.slash_command(name="demote")
@@ -204,26 +181,36 @@ async def demote(ctx, username: str, reason: str):
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ No Permission", "Missing admin role.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
 
     user_id = get_user_id(username)
 
     if not user_id:
-        return await ctx.respond(
-            embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
 
     if rank_down(user_id):
 
-        await ctx.respond(embed=embed("📉 Demoted", f"{username} has been demoted.", discord.Color.orange()))
+        await ctx.respond(embed=embed("📉 Demoted", f"{username}", discord.Color.orange()))
 
+        # 🔥 LOG
         await send_log(ctx.guild,
             "🔴 MANUAL DEMOTE",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: {reason}",
             discord.Color.red()
         )
+
+        # 🔥 NEW: DM TO USER (ADDED)
+        try:
+            target_member = await bot.fetch_user(user_id)
+
+            await send_dm(target_member, embed(
+                "⚠️ You Have Been Demoted From The Turf",
+                f"Reason: {reason}",
+                discord.Color.red()
+            ))
+
+        except:
+            pass
 
 # ---------------- /reset ----------------
 @bot.slash_command(name="reset")
@@ -234,14 +221,12 @@ async def reset(ctx, member: discord.Member):
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ No Permission", "Missing admin role.", discord.Color.red())
-        )
+        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
 
     reset_application(member.id)
     user_links.pop(member.id, None)
 
-    await ctx.respond(embed=embed("🔄 Reset Done", f"{member.name}", discord.Color.blue()))
+    await ctx.respond(embed=embed("🔄 Reset Done", member.name, discord.Color.blue()))
 
     await send_log(ctx.guild,
         "🔵 RESET ACTION",
