@@ -54,9 +54,9 @@ def reset_application(discord_id):
             cur.execute("DELETE FROM applications WHERE discord_id = %s", (discord_id,))
             conn.commit()
 
-# ---------------- FIXED ROLE CHECK ----------------
+# ---------------- ROLE CHECK ----------------
 def has_role(member, role_id):
-    return any(str(r.id) == str(role_id) for r in member.roles)
+    return any(r.id == role_id for r in member.roles)
 
 # ---------------- ROBLOX ----------------
 def patch_with_csrf(url, json_data):
@@ -77,7 +77,6 @@ def get_user_id(username):
             "usernames": [username],
             "excludeBannedUsers": True
         })
-
         if r.status_code == 200 and r.json().get("data"):
             return r.json()["data"][0]["id"]
     except:
@@ -206,8 +205,8 @@ async def reset(ctx, member: discord.Member):
 
     admin = ctx.author
 
-    # FIXED ROLE CHECK (ROBUST)
-    if not has_role(admin, ALLOWED_ROLE_ID):
+    # ONLY DEMOTE ROLE CAN USE RESET
+    if not has_role(admin, DEMOTE_ROLE_ID):
         return await ctx.respond(embed=embed("❌ No Permission", "", discord.Color.red()))
 
     reset_application(member.id)
