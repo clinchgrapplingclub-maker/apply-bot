@@ -22,7 +22,7 @@ DEMOTE_ROLE_ID = int(os.getenv("DEMOTE_ROLE_ID"))
 DEMOTE_RANK_ID = int(os.getenv("DEMOTE_RANK_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
-user_links = {}
+user_links = {}  # discord_id -> roblox_id
 
 roblox_headers = {
     'Content-Type': 'application/json',
@@ -54,7 +54,7 @@ def reset_application(discord_id):
             cur.execute("DELETE FROM applications WHERE discord_id = %s", (discord_id,))
             conn.commit()
 
-# ---------------- ROLE CHECK ----------------
+# ---------------- ROLE ----------------
 def has_role(member, role_id):
     return any(r.id == role_id for r in member.roles)
 
@@ -107,7 +107,7 @@ def rank_down(user_id):
         {"roleId": DEMOTE_RANK_ID}
     ).status_code == 200
 
-# ---------------- EMBEDS ----------------
+# ---------------- EMBED ----------------
 def embed(title, desc, color):
     e = discord.Embed(
         title=title,
@@ -123,9 +123,9 @@ async def send_log(guild, title, desc, color):
     if ch:
         await ch.send(embed=embed(title, desc, color))
 
-async def send_dm(user, e):
+async def send_dm(user, embed_msg):
     try:
-        await user.send(embed=e)
+        await user.send(embed=embed_msg)
     except:
         pass
 
@@ -166,6 +166,13 @@ async def turfapply(ctx, username: str):
 
         await ctx.respond(embed=embed("✅ Accepted", "You have been ranked!", discord.Color.green()))
 
+        # ✅ FIXED LOG (was missing sometimes)
+        await send_log(ctx.guild,
+            "🟢 APPLICATION APPROVED",
+            f"Discord: {member} ({member.id})\nRoblox ID: {user_id}\nUsername: {username}",
+            discord.Color.green()
+        )
+
         await send_dm(member, embed(
             "🎉 Welcome To The Turf",
             "You've been successfully ranked!",
@@ -190,27 +197,29 @@ async def demote(ctx, username: str, reason: str):
 
     if rank_down(user_id):
 
-        await ctx.respond(embed=embed("📉 Demoted", f"{username}", discord.Color.orange()))
+        await ctx.respond(embed=embed("📉 Demoted", username, discord.Color.orange()))
 
-        # 🔥 LOG
         await send_log(ctx.guild,
             "🔴 MANUAL DEMOTE",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: {reason}",
             discord.Color.red()
         )
 
-        # 🔥 NEW: DM TO USER (ADDED)
-        try:
-            target_member = await bot.fetch_user(user_id)
+        # 🔥 FIXED DM (now works)
+        target = None
+        for discord_id, roblox_id in user_links.items():
+            if roblox_id == user_id:
+                target = discord_id
+                break
 
-            await send_dm(target_member, embed(
+        if target:
+            user_obj = await bot.fetch_user(target)
+
+            await send_dm(user_obj, embed(
                 "⚠️ You Have Been Demoted From The Turf",
                 f"Reason: {reason}",
                 discord.Color.red()
             ))
-
-        except:
-            pass
 
 # ---------------- /reset ----------------
 @bot.slash_command(name="reset")
