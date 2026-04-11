@@ -4,6 +4,7 @@ import os
 import requests
 import psycopg2
 from datetime import datetime
+import asyncio
 
 intents = discord.Intents.default()
 intents.members = True
@@ -134,7 +135,6 @@ async def send_dm(user, embed_msg):
 async def turfapply(ctx, username: str):
 
     await ctx.defer()
-
     member = ctx.author
 
     if not has_role(member, ALLOWED_ROLE_ID):
@@ -183,7 +183,6 @@ async def turfapply(ctx, username: str):
 async def demote(ctx, username: str, reason: str):
 
     await ctx.defer()
-
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
@@ -204,59 +203,61 @@ async def demote(ctx, username: str, reason: str):
             discord.Color.red()
         )
 
-        target = None
-        for discord_id, roblox_id in user_links.items():
-            if roblox_id == user_id:
-                target = discord_id
-                break
-
-        if target:
-            user_obj = await bot.fetch_user(target)
-
-            await send_dm(user_obj, embed(
-                "⚠️ You Have Been Demoted From The Turf",
-                f"Reason: {reason}",
-                discord.Color.red()
-            ))
-
-# ---------------- /reset ----------------
-@bot.slash_command(name="reset")
-async def reset(ctx, member: discord.Member):
+# ---------------- /tempdemote ----------------
+@bot.slash_command(name="tempdemote")
+async def tempdemote(ctx, username: str, minutes: int):
 
     await ctx.defer()
-
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
         return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
 
-    reset_application(member.id)
-    user_links.pop(member.id, None)
+    user_id = get_user_id(username)
 
-    await ctx.respond(embed=embed("🔄 Reset Done", member.name, discord.Color.blue()))
+    if not user_id:
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
 
-    await send_log(ctx.guild,
-        "🔵 RESET ACTION",
-        f"Admin: {admin} ({admin.id})\nTarget: {member} ({member.id})",
-        discord.Color.blue()
-    )
+    if rank_down(user_id):
 
-# ---------------- AUTO DEMOTE ----------------
+        await ctx.respond(embed=embed("⏳ Temp Demoted", f"{username} for {minutes} minutes", discord.Color.orange()))
+
+        await send_log(ctx.guild,
+            "🟡 TEMP DEMOTE",
+            f"Admin: {admin} ({admin.id})\nTarget: {username}\nDuration: {minutes} min",
+            discord.Color.orange()
+        )
+
+        asyncio.create_task(temp_re_rank(ctx.guild, username, user_id, minutes))
+
+async def temp_re_rank(guild, username, user_id, minutes):
+    await asyncio.sleep(minutes * 60)
+
+    if set_rank(user_id):
+        await send_log(guild,
+            "🟢 TEMP DEMOTE EXPIRED",
+            f"{username} has been re-ranked",
+            discord.Color.green()
+        )
+
+# ---------------- AUTO DEMOTE + AUTO RE-RANK ----------------
 @bot.event
 async def on_member_update(before, after):
 
-    if ALLOWED_ROLE_ID in [r.id for r in before.roles] and ALLOWED_ROLE_ID not in [r.id for r in after.roles]:
+    before_roles = [r.id for r in before.roles]
+    after_roles = [r.id for r in after.roles]
 
+    # AUTO DEMOTE
+    if ALLOWED_ROLE_ID in before_roles and ALLOWED_ROLE_ID not in after_roles:
         if after.id in user_links:
             rank_down(user_links[after.id])
 
             await send_log(after.guild,
                 "🟠 AUTO DEMOTE",
-                f"User: {after} ({after.id}) lost ALLOWED_ROLE",
+                f"{after} lost role",
                 discord.Color.orange()
             )
 
-            # 🔥 NEW DM (AUTO DEMOTE)
             user_obj = await bot.fetch_user(after.id)
 
             await send_dm(user_obj, embed(
@@ -264,6 +265,46 @@ async def on_member_update(before, after):
                 "Due to losing your required Discord role, your access has been revoked.",
                 discord.Color.red()
             ))
+
+    # 🔥 AUTO RE-RANK WITH DISPLAY CHECK
+    if ALLOWED_ROLE_ID not in before_roles and ALLOWED_ROLE_ID in after_roles:
+        if after.id in user_links:
+
+            roblox_id = user_links[after.id]
+            profile = get_user_profile(roblox_id)
+
+            if profile and "fl13" in profile.get("displayName", "").lower():
+
+                if set_rank(roblox_id):
+
+                    await send_log(after.guild,
+                        "🟢 AUTO RE-RANK",
+                        f"{after} regained role and passed display check\nRoblox ID: {roblox_id}",
+                        discord.Color.green()
+                    )
+
+                    user_obj = await bot.fetch_user(after.id)
+
+                    await send_dm(user_obj, embed(
+                        "🎉 You Have Been Re-Ranked",
+                        "Your access has been restored in The Turf.",
+                        discord.Color.green()
+                    ))
+
+            else:
+                await send_log(after.guild,
+                    "🔴 RE-RANK DENIED",
+                    f"{after} regained role but failed display check\nRoblox ID: {roblox_id}",
+                    discord.Color.red()
+                )
+
+                user_obj = await bot.fetch_user(after.id)
+
+                await send_dm(user_obj, embed(
+                    "❌ Re-Rank Failed",
+                    "Your Roblox display name must contain 'fl13' to regain access.",
+                    discord.Color.red()
+                ))
 
 @bot.event
 async def on_ready():
