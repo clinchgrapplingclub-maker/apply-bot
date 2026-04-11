@@ -22,7 +22,7 @@ DEMOTE_ROLE_ID = int(os.getenv("DEMOTE_ROLE_ID"))
 DEMOTE_RANK_ID = int(os.getenv("DEMOTE_RANK_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 
-user_links = {}  # discord_id -> roblox_id
+user_links = {}
 
 roblox_headers = {
     'Content-Type': 'application/json',
@@ -166,7 +166,6 @@ async def turfapply(ctx, username: str):
 
         await ctx.respond(embed=embed("✅ Accepted", "You have been ranked!", discord.Color.green()))
 
-        # ✅ FIXED LOG (was missing sometimes)
         await send_log(ctx.guild,
             "🟢 APPLICATION APPROVED",
             f"Discord: {member} ({member.id})\nRoblox ID: {user_id}\nUsername: {username}",
@@ -205,7 +204,6 @@ async def demote(ctx, username: str, reason: str):
             discord.Color.red()
         )
 
-        # 🔥 FIXED DM (now works)
         target = None
         for discord_id, roblox_id in user_links.items():
             if roblox_id == user_id:
@@ -257,6 +255,15 @@ async def on_member_update(before, after):
                 f"User: {after} ({after.id}) lost ALLOWED_ROLE",
                 discord.Color.orange()
             )
+
+            # 🔥 NEW DM (AUTO DEMOTE)
+            user_obj = await bot.fetch_user(after.id)
+
+            await send_dm(user_obj, embed(
+                "⚠️ You Have Been Demoted From The Turf",
+                "Due to losing your required Discord role, your access has been revoked.",
+                discord.Color.red()
+            ))
 
 @bot.event
 async def on_ready():
