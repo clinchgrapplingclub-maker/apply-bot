@@ -1,4 +1,4 @@
-​​​​import discord
+import discord
 from discord.ext import commands
 import os
 import requests
@@ -311,4 +311,3 @@ async def on_ready():
     print(f"Bot online: {bot.user}")
 
 bot.run(DISCORD_TOKEN)
-
