@@ -38,6 +38,9 @@ LOG_CHANNEL_ID = get_env("LOG_CHANNEL_ID", cast=int)
 REQUEST_TIMEOUT = 15
 DISPLAY_REQUIRED_TEXT = "fl13"
 
+SUCCESS_COLOR = discord.Color.from_rgb(255, 255, 255)  # white
+FAIL_COLOR = discord.Color.from_rgb(0, 0, 0)           # black
+
 roblox_headers = {
     "Content-Type": "application/json",
     "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"
@@ -458,7 +461,7 @@ class RankSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.ctx.author.id:
             return await interaction.response.send_message(
-                embed=embed("❌ Not Allowed", "Only the command user can choose a rank.", discord.Color.red()),
+                embed=embed("Not Allowed", "Only the command user can choose a rank.", FAIL_COLOR),
                 ephemeral=True
             )
 
@@ -470,9 +473,9 @@ class RankSelect(discord.ui.Select):
         if current_role_id == selected_role_id:
             return await interaction.response.send_message(
                 embed=embed(
-                    "ℹ️ Already That Rank",
+                    "Already That Rank",
                     f"{self.target_username} is already ranked as {selected_role_name}.",
-                    discord.Color.blue()
+                    FAIL_COLOR
                 ),
                 ephemeral=True
             )
@@ -482,12 +485,12 @@ class RankSelect(discord.ui.Select):
         if not ok:
             await send_log(
                 self.ctx.guild,
-                "❌ /rank FAILED",
+                "/rank FAILED",
                 f"Admin: {self.ctx.author} ({self.ctx.author.id})\nTarget: {self.target_username}\nRoblox ID: {self.target_user_id}\nRequested rank: {selected_role_name} ({selected_role_id})\nReason: Rank API failed",
-                discord.Color.red()
+                FAIL_COLOR
             )
             return await interaction.response.send_message(
-                embed=embed("❌ Rank Failed", "Could not set that Roblox rank.", discord.Color.red()),
+                embed=embed("Rank Failed", "Could not set that Roblox rank.", FAIL_COLOR),
                 ephemeral=True
             )
 
@@ -499,28 +502,28 @@ class RankSelect(discord.ui.Select):
 
         await send_log(
             self.ctx.guild,
-            "🟢 /rank SUCCESS",
+            "/rank SUCCESS",
             f"Admin: {self.ctx.author} ({self.ctx.author.id})\nTarget: {self.target_username}\nRoblox ID: {self.target_user_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {selected_role_name} ({selected_role_id})",
-            discord.Color.green()
+            SUCCESS_COLOR
         )
 
         if self.target_discord_id is not None:
             await dm_by_discord_id(
                 self.target_discord_id,
                 embed(
-                    "🟢 Your Roblox Group Rank Was Updated",
+                    "Your Roblox Group Rank Was Updated",
                     f"You have been ranked to: {selected_role_name}.",
-                    discord.Color.green()
+                    SUCCESS_COLOR
                 )
             )
 
         await interaction.response.send_message(
             embed=embed(
-                "✅ Rank Updated",
+                "Rank Updated",
                 f"{self.target_username} has been ranked to {selected_role_name}.",
-                discord.Color.green()
+                SUCCESS_COLOR
             ),
-            ephemeral=True
+            ephemeral=False
         )
 
 class RankView(discord.ui.View):
@@ -537,58 +540,58 @@ async def turfapply(ctx, username: str):
     if not has_role(member, ALLOWED_ROLE_ID):
         await log_command(
             ctx,
-            "❌ /turfapply DENIED",
+            "/turfapply DENIED",
             f"User: {member} ({member.id})\nUsername: {username}\nReason: Missing role",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Access Denied", "Missing role.", discord.Color.red()))
+        return await ctx.respond(embed=embed("Access Denied", "Missing role.", FAIL_COLOR))
 
     if has_applied(member.id):
         await log_command(
             ctx,
-            "⚠️ /turfapply BLOCKED",
+            "/turfapply BLOCKED",
             f"User: {member} ({member.id})\nUsername: {username}\nReason: Already applied",
-            discord.Color.orange()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("⚠️ Already Applied", "You already applied.", discord.Color.orange()))
+        return await ctx.respond(embed=embed("Already Applied", "You already applied.", FAIL_COLOR))
 
     user_id = get_user_id(username)
     if not user_id:
         await log_command(
             ctx,
-            "❌ /turfapply FAILED",
+            "/turfapply FAILED",
             f"User: {member} ({member.id})\nUsername: {username}\nReason: Invalid Roblox username",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red()))
+        return await ctx.respond(embed=embed("User Not Found", "Invalid Roblox username.", FAIL_COLOR))
 
     profile = get_user_profile(user_id)
     if not profile:
         await log_command(
             ctx,
-            "❌ /turfapply FAILED",
+            "/turfapply FAILED",
             f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Could not fetch profile",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Error", "Could not fetch profile.", discord.Color.red()))
+        return await ctx.respond(embed=embed("Error", "Could not fetch profile.", FAIL_COLOR))
 
     if not display_name_ok(profile):
         await log_command(
             ctx,
-            "❌ /turfapply FAILED",
+            "/turfapply FAILED",
             f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Display name missing '{DISPLAY_REQUIRED_TEXT}'",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Invalid Display Name", f"Your Roblox display must contain '{DISPLAY_REQUIRED_TEXT}'.", discord.Color.red()))
+        return await ctx.respond(embed=embed("Invalid Display Name", f"Your Roblox display must contain '{DISPLAY_REQUIRED_TEXT}'.", FAIL_COLOR))
 
     if not is_in_group(user_id):
         await log_command(
             ctx,
-            "❌ /turfapply FAILED",
+            "/turfapply FAILED",
             f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Not in Roblox group",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Not In Group", "You must be in the Roblox group.", discord.Color.red()))
+        return await ctx.respond(embed=embed("Not In Group", "You must be in the Roblox group.", FAIL_COLOR))
 
     current_role_id = get_user_rank_in_group(user_id)
     current_role_name = get_user_role_name_in_group(user_id)
@@ -596,12 +599,12 @@ async def turfapply(ctx, username: str):
     if current_role_id == RANK_ID:
         await log_command(
             ctx,
-            "ℹ️ /turfapply ALREADY RANKED",
+            "/turfapply ALREADY RANKED",
             f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name} ({current_role_id})",
-            discord.Color.blue()
+            SUCCESS_COLOR
         )
         return await ctx.respond(
-            embed=embed("ℹ️ Already Ranked", f"You are already ranked as {current_role_name}.", discord.Color.blue())
+            embed=embed("Already Ranked", f"You are already ranked as {current_role_name}.", SUCCESS_COLOR)
         )
 
     if current_role_id is not None and current_role_id != RANK_ID:
@@ -613,12 +616,12 @@ async def turfapply(ctx, username: str):
             if int(current_role_data.get("rank", 0)) > int(target_role_data.get("rank", 0)):
                 await log_command(
                     ctx,
-                    "ℹ️ /turfapply HIGHER RANK",
+                    "/turfapply HIGHER RANK",
                     f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name} ({current_role_id})",
-                    discord.Color.blue()
+                    SUCCESS_COLOR
                 )
                 return await ctx.respond(
-                    embed=embed("ℹ️ Already Higher Rank", f"You already have a higher rank: {current_role_name}.", discord.Color.blue())
+                    embed=embed("Already Higher Rank", f"You already have a higher rank: {current_role_name}.", SUCCESS_COLOR)
                 )
 
     if set_rank(user_id):
@@ -626,31 +629,31 @@ async def turfapply(ctx, username: str):
         user_links[member.id] = user_id
         save_member_state(member.id, user_id, True, True, True, "ranked")
 
-        await ctx.respond(embed=embed("✅ Accepted", f"You have been ranked as {RANK_NAME}!", discord.Color.green()))
+        await ctx.respond(embed=embed("Accepted", f"You have been ranked as {RANK_NAME}!", SUCCESS_COLOR))
 
         await log_command(
             ctx,
-            "🟢 /turfapply SUCCESS",
+            "/turfapply SUCCESS",
             f"User: {member} ({member.id})\nRoblox Username: {username}\nRoblox ID: {user_id}",
-            discord.Color.green()
+            SUCCESS_COLOR
         )
 
         await send_dm(
             member,
             embed(
-                "🎉 Welcome To The Turf",
+                "Welcome To The Turf",
                 f"You have been accepted and ranked as {RANK_NAME}.",
-                discord.Color.green()
+                SUCCESS_COLOR
             )
         )
     else:
         await log_command(
             ctx,
-            "❌ /turfapply FAILED",
+            "/turfapply FAILED",
             f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        await ctx.respond(embed=embed("❌ Rank Failed", "Could not set Roblox rank. Try again later.", discord.Color.red()))
+        await ctx.respond(embed=embed("Rank Failed", "Could not set Roblox rank. Try again later.", FAIL_COLOR))
 
 # ---------------- /demote ----------------
 @bot.slash_command(name="demote")
@@ -661,21 +664,21 @@ async def demote(ctx, username: str, reason: str):
     if not has_role(admin, DEMOTE_ROLE_ID):
         await log_command(
             ctx,
-            "❌ /demote DENIED",
+            "/demote DENIED",
             f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
+        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR))
 
     user_id = get_user_id(username)
     if not user_id:
         await log_command(
             ctx,
-            "❌ /demote FAILED",
+            "/demote FAILED",
             f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
+        return await ctx.respond(embed=embed("User Not Found", "Invalid username.", FAIL_COLOR))
 
     discord_id = get_discord_id_by_roblox(user_id)
     current_role_id = get_user_rank_in_group(user_id)
@@ -685,12 +688,12 @@ async def demote(ctx, username: str, reason: str):
     if current_role_id == DEMOTE_RANK_ID:
         await log_command(
             ctx,
-            "ℹ️ /demote SKIPPED",
+            "/demote SKIPPED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Already demoted rank ({target_role_name})",
-            discord.Color.blue()
+            SUCCESS_COLOR
         )
         return await ctx.respond(
-            embed=embed("ℹ️ Already Demoted", f"{username} is already {target_role_name}.", discord.Color.blue())
+            embed=embed("Already Demoted", f"{username} is already {target_role_name}.", SUCCESS_COLOR)
         )
 
     if rank_down(user_id):
@@ -700,32 +703,32 @@ async def demote(ctx, username: str, reason: str):
         if discord_id is not None:
             save_member_state(discord_id, user_id, True, True, True, "manual_demoted")
 
-        await ctx.respond(embed=embed("📉 Demoted", f"{username}\nReason: {reason}", discord.Color.orange()))
+        await ctx.respond(embed=embed("Demoted", f"{username}\nReason: {reason}", SUCCESS_COLOR))
 
         await log_command(
             ctx,
-            "🔴 /demote SUCCESS",
+            "/demote SUCCESS",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {target_role_name} ({DEMOTE_RANK_ID})\nReason: {reason}",
-            discord.Color.red()
+            SUCCESS_COLOR
         )
 
         if discord_id is not None:
             await dm_by_discord_id(
                 discord_id,
                 embed(
-                    "🔴 You Have Been Permanently Demoted",
+                    "You Have Been Permanently Demoted",
                     f"You have been demoted from The Turf.\n\nReason: {reason}\nDuration: Permanent",
-                    discord.Color.red()
+                    FAIL_COLOR
                 )
             )
     else:
         await log_command(
             ctx,
-            "❌ /demote FAILED",
+            "/demote FAILED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        await ctx.respond(embed=embed("❌ Demote Failed", "Could not change Roblox rank.", discord.Color.red()))
+        await ctx.respond(embed=embed("Demote Failed", "Could not change Roblox rank.", FAIL_COLOR))
 
 # ---------------- /tempdemote ----------------
 @bot.slash_command(name="tempdemote")
@@ -736,31 +739,31 @@ async def tempdemote(ctx, username: str, duration: str, reason: str):
     if not has_role(admin, DEMOTE_ROLE_ID):
         await log_command(
             ctx,
-            "❌ /tempdemote DENIED",
+            "/tempdemote DENIED",
             f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
+        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR))
 
     delta = parse_duration(duration)
     if delta is None:
         await log_command(
             ctx,
-            "❌ /tempdemote FAILED",
+            "/tempdemote FAILED",
             f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid duration '{duration}'",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Invalid Duration", "Use for example: 1min, 5min, 1h, 12h, 1d", discord.Color.red()))
+        return await ctx.respond(embed=embed("Invalid Duration", "Use for example: 1min, 5min, 1h, 12h, 1d", FAIL_COLOR))
 
     user_id = get_user_id(username)
     if not user_id:
         await log_command(
             ctx,
-            "❌ /tempdemote FAILED",
+            "/tempdemote FAILED",
             f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
+        return await ctx.respond(embed=embed("User Not Found", "Invalid username.", FAIL_COLOR))
 
     discord_id = get_discord_id_by_roblox(user_id)
     expires_at = datetime.now(timezone.utc) + delta
@@ -773,23 +776,23 @@ async def tempdemote(ctx, username: str, duration: str, reason: str):
 
         await log_command(
             ctx,
-            "ℹ️ /tempdemote UPDATED",
+            "/tempdemote UPDATED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Already on demoted rank, timer updated\nDuration: {duration}\nExpires: {format_dt(expires_at)}",
-            discord.Color.blue()
+            SUCCESS_COLOR
         )
 
         if discord_id is not None:
             await dm_by_discord_id(
                 discord_id,
                 embed(
-                    "🟡 Temporary Demotion Updated",
+                    "Temporary Demotion Updated",
                     f"Your temporary demotion timer has been updated.\n\nReason: {reason}\nDuration: {duration}\nEnds: {format_dt(expires_at)}",
-                    discord.Color.orange()
+                    SUCCESS_COLOR
                 )
             )
 
         return await ctx.respond(
-            embed=embed("ℹ️ Temp Demotion Updated", f"{username} was already demoted. Timer updated to {duration}.", discord.Color.blue())
+            embed=embed("Temp Demotion Updated", f"{username} was already demoted. Timer updated to {duration}.", SUCCESS_COLOR)
         )
 
     if rank_down(user_id):
@@ -798,32 +801,32 @@ async def tempdemote(ctx, username: str, duration: str, reason: str):
         if discord_id is not None:
             save_member_state(discord_id, user_id, True, True, True, "temp_demoted")
 
-        await ctx.respond(embed=embed("⏳ Temp Demoted", f"{username}\nDuration: {duration}\nReason: {reason}", discord.Color.orange()))
+        await ctx.respond(embed=embed("Temp Demoted", f"{username}\nDuration: {duration}\nReason: {reason}", SUCCESS_COLOR))
 
         await log_command(
             ctx,
-            "🟡 /tempdemote SUCCESS",
+            "/tempdemote SUCCESS",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {target_role_name} ({DEMOTE_RANK_ID})\nDuration: {duration}\nExpires: {format_dt(expires_at)}\nReason: {reason}",
-            discord.Color.orange()
+            SUCCESS_COLOR
         )
 
         if discord_id is not None:
             await dm_by_discord_id(
                 discord_id,
                 embed(
-                    "🟡 You Have Been Temporarily Demoted",
+                    "You Have Been Temporarily Demoted",
                     f"You have been temporarily demoted from The Turf.\n\nReason: {reason}\nDuration: {duration}\nEnds: {format_dt(expires_at)}",
-                    discord.Color.orange()
+                    FAIL_COLOR
                 )
             )
     else:
         await log_command(
             ctx,
-            "❌ /tempdemote FAILED",
+            "/tempdemote FAILED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        await ctx.respond(embed=embed("❌ Temp Demote Failed", "Could not change Roblox rank.", discord.Color.red()))
+        await ctx.respond(embed=embed("Temp Demote Failed", "Could not change Roblox rank.", FAIL_COLOR))
 
 # ---------------- /rank ----------------
 @bot.slash_command(name="rank")
@@ -834,40 +837,40 @@ async def rank(ctx, username: str):
     if not has_role(admin, DEMOTE_ROLE_ID):
         await log_command(
             ctx,
-            "❌ /rank DENIED",
+            "/rank DENIED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: Missing permission role",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()), ephemeral=True)
+        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR), ephemeral=True)
 
     user_id = get_user_id(username)
     if not user_id:
         await log_command(
             ctx,
-            "❌ /rank FAILED",
+            "/rank FAILED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: Invalid Roblox username",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red()), ephemeral=True)
+        return await ctx.respond(embed=embed("User Not Found", "Invalid Roblox username.", FAIL_COLOR), ephemeral=True)
 
     if not is_in_group(user_id):
         await log_command(
             ctx,
-            "❌ /rank FAILED",
+            "/rank FAILED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: User not in Roblox group",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Not In Group", "That user is not in the Roblox group.", discord.Color.red()), ephemeral=True)
+        return await ctx.respond(embed=embed("Not In Group", "That user is not in the Roblox group.", FAIL_COLOR), ephemeral=True)
 
     roles = get_group_roles()
     if not roles:
         await log_command(
             ctx,
-            "❌ /rank FAILED",
+            "/rank FAILED",
             f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Could not fetch group roles",
-            discord.Color.red()
+            FAIL_COLOR
         )
-        return await ctx.respond(embed=embed("❌ Error", "Could not fetch group ranks.", discord.Color.red()), ephemeral=True)
+        return await ctx.respond(embed=embed("Error", "Could not fetch group ranks.", FAIL_COLOR), ephemeral=True)
 
     roles_sorted = sorted(roles, key=lambda r: int(r.get("rank", 0)), reverse=True)
     discord_id = get_discord_id_by_roblox(user_id)
@@ -875,16 +878,16 @@ async def rank(ctx, username: str):
 
     await log_command(
         ctx,
-        "🟣 /rank OPENED",
+        "/rank OPENED",
         f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name}",
-        discord.Color.blurple()
+        SUCCESS_COLOR
     )
 
     await ctx.respond(
         embed=embed(
             "Select Rank",
             f"Choose a new Roblox rank for {username}.\nCurrent role: {current_role_name}",
-            discord.Color.blurple()
+            SUCCESS_COLOR
         ),
         view=RankView(ctx, username, user_id, discord_id, roles_sorted),
         ephemeral=True
@@ -919,18 +922,18 @@ async def process_expired_temp_demotions():
             if guild:
                 await send_log(
                     guild,
-                    "🟢 TEMP DEMOTE ENDED",
+                    "TEMP DEMOTE ENDED",
                     f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nOriginal reason: {reason}\nOriginal duration: {duration_text}",
-                    discord.Color.green()
+                    SUCCESS_COLOR
                 )
 
             if discord_id is not None:
                 await dm_by_discord_id(
                     int(discord_id),
                     embed(
-                        "🟢 Temp Demotion Ended",
+                        "Temp Demotion Ended",
                         f"Your temporary demotion has ended and your access has been restored.\n\nPrevious reason: {reason}\nPrevious duration: {duration_text}",
-                        discord.Color.green()
+                        SUCCESS_COLOR
                     )
                 )
 
@@ -940,18 +943,18 @@ async def process_expired_temp_demotions():
             if guild:
                 await send_log(
                     guild,
-                    "🔴 TEMP DEMOTE ENDED - NO RE-RANK",
+                    "TEMP DEMOTE ENDED - NO RE-RANK",
                     f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nBlocked manual demote: {blocked}\nHas role: {has_role_flag}\nDisplay ok: {display_ok}\nGroup ok: {group_ok}",
-                    discord.Color.red()
+                    FAIL_COLOR
                 )
 
             if discord_id is not None:
                 await dm_by_discord_id(
                     int(discord_id),
                     embed(
-                        "🔴 Temp Demotion Ended - Access Not Restored",
+                        "Temp Demotion Ended - Access Not Restored",
                         "Your temporary demotion has ended, but your access was not restored because one or more requirements are not currently met.",
-                        discord.Color.red()
+                        FAIL_COLOR
                     )
                 )
 
@@ -988,16 +991,16 @@ async def evaluate_member_access(discord_id, roblox_id):
             if set_rank(roblox_id):
                 await send_log(
                     guild,
-                    "🟢 AUTO RE-RANK",
+                    "AUTO RE-RANK",
                     f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Role/display/group requirements restored",
-                    discord.Color.green()
+                    SUCCESS_COLOR
                 )
                 await send_dm(
                     member,
                     embed(
-                        "🎉 You Have Been Re-Ranked",
+                        "You Have Been Re-Ranked",
                         "Your required role/display conditions are now valid again, and your access has been restored in The Turf.",
-                        discord.Color.green()
+                        SUCCESS_COLOR
                     )
                 )
                 save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
@@ -1005,9 +1008,9 @@ async def evaluate_member_access(discord_id, roblox_id):
             else:
                 await send_log(
                     guild,
-                    "❌ AUTO RE-RANK FAILED",
+                    "AUTO RE-RANK FAILED",
                     f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Rank API failed",
-                    discord.Color.red()
+                    FAIL_COLOR
                 )
                 save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "deranked")
                 return
@@ -1033,18 +1036,18 @@ async def evaluate_member_access(discord_id, roblox_id):
 
             await send_log(
                 guild,
-                "🟠 AUTO DERANK",
+                "AUTO DERANK",
                 f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: {reason_text}",
-                discord.Color.orange()
+                FAIL_COLOR
             )
 
             if not blocked_manual and not blocked_temp:
                 await send_dm(
                     member,
                     embed(
-                        "⚠️ Your Access Has Been Revoked",
+                        "Your Access Has Been Revoked",
                         f"You were deranked from The Turf because: {reason_text}. When the required conditions are restored, your access can be restored automatically.",
-                        discord.Color.red()
+                        FAIL_COLOR
                     )
                 )
 
