@@ -1,11 +1,11 @@
 import discord
 from discord.ext import commands, tasks
 import os
+import re
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta, timezone
-import asyncio
 
 intents = discord.Intents.default()
 intents.members = True
@@ -35,14 +35,15 @@ DEMOTE_ROLE_ID = get_env("DEMOTE_ROLE_ID", cast=int)
 DEMOTE_RANK_ID = get_env("DEMOTE_RANK_ID", cast=int)
 LOG_CHANNEL_ID = get_env("LOG_CHANNEL_ID", cast=int)
 
-REQUEST_TIMEOUT = 10
+REQUEST_TIMEOUT = 15
+DISPLAY_REQUIRED_TEXT = "fl13"
 
 roblox_headers = {
     "Content-Type": "application/json",
     "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"
 }
 
-# In-memory cache, but DB is source of truth
+# Cache only, DB is source of truth
 user_links = {}
 
 # ---------------- DB ----------------
@@ -55,19 +56,41 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS applications (
                     discord_id BIGINT PRIMARY KEY,
-                    roblox_id BIGINT NOT NULL,
+                    roblox_id BIGINT NOT NULL UNIQUE,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS temp_demotions (
+                    roblox_id BIGINT PRIMARY KEY,
                     discord_id BIGINT,
-                    roblox_id BIGINT NOT NULL,
                     username TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    duration_text TEXT NOT NULL,
                     expires_at TIMESTAMPTZ NOT NULL,
                     created_by BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (discord_id, roblox_id)
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS manual_demotions (
+                    roblox_id BIGINT PRIMARY KEY,
+                    discord_id BIGINT,
+                    username TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_by BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS member_state (
+                    discord_id BIGINT PRIMARY KEY,
+                    roblox_id BIGINT NOT NULL,
+                    last_has_role BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_display_ok BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_group_ok BOOLEAN NOT NULL DEFAULT FALSE,
+                    last_rank_state TEXT NOT NULL DEFAULT 'unknown',
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
             conn.commit()
@@ -100,7 +123,14 @@ def get_roblox_id_by_discord(discord_id):
         with conn.cursor() as cur:
             cur.execute("SELECT roblox_id FROM applications WHERE discord_id = %s", (discord_id,))
             row = cur.fetchone()
-            return row[0] if row else None
+            return int(row[0]) if row else None
+
+def get_discord_id_by_roblox(roblox_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT discord_id FROM applications WHERE roblox_id = %s", (roblox_id,))
+            row = cur.fetchone()
+            return int(row[0]) if row and row[0] is not None else None
 
 def load_user_links():
     global user_links
@@ -108,21 +138,30 @@ def load_user_links():
         with conn.cursor() as cur:
             cur.execute("SELECT discord_id, roblox_id FROM applications")
             rows = cur.fetchall()
-            user_links = {int(discord_id): int(roblox_id) for discord_id, roblox_id in rows}
+            user_links = {int(d): int(r) for d, r in rows}
 
-def save_temp_demote(discord_id, roblox_id, username, expires_at, created_by):
+def save_temp_demote(discord_id, roblox_id, username, reason, duration_text, expires_at, created_by):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO temp_demotions (discord_id, roblox_id, username, expires_at, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (discord_id, roblox_id)
+                INSERT INTO temp_demotions (roblox_id, discord_id, username, reason, duration_text, expires_at, created_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (roblox_id)
                 DO UPDATE SET
+                    discord_id = EXCLUDED.discord_id,
                     username = EXCLUDED.username,
+                    reason = EXCLUDED.reason,
+                    duration_text = EXCLUDED.duration_text,
                     expires_at = EXCLUDED.expires_at,
                     created_by = EXCLUDED.created_by
-            """, (discord_id, roblox_id, username, expires_at, created_by))
+            """, (roblox_id, discord_id, username, reason, duration_text, expires_at, created_by))
             conn.commit()
+
+def get_temp_demote(roblox_id):
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM temp_demotions WHERE roblox_id = %s", (roblox_id,))
+            return cur.fetchone()
 
 def delete_temp_demote(roblox_id):
     with get_connection() as conn:
@@ -133,24 +172,70 @@ def delete_temp_demote(roblox_id):
 def get_expired_temp_demotions():
     with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM temp_demotions WHERE expires_at <= NOW()")
+            return cur.fetchall()
+
+def save_manual_demote(discord_id, roblox_id, username, reason, created_by):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
             cur.execute("""
-                SELECT discord_id, roblox_id, username, expires_at, created_by
-                FROM temp_demotions
-                WHERE expires_at <= NOW()
-            """)
+                INSERT INTO manual_demotions (roblox_id, discord_id, username, reason, created_by)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (roblox_id)
+                DO UPDATE SET
+                    discord_id = EXCLUDED.discord_id,
+                    username = EXCLUDED.username,
+                    reason = EXCLUDED.reason,
+                    created_by = EXCLUDED.created_by
+            """, (roblox_id, discord_id, username, reason, created_by))
+            conn.commit()
+
+def is_manual_demoted(roblox_id):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM manual_demotions WHERE roblox_id = %s", (roblox_id,))
+            return cur.fetchone() is not None
+
+def save_member_state(discord_id, roblox_id, has_role_flag, display_ok, group_ok, rank_state):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO member_state (discord_id, roblox_id, last_has_role, last_display_ok, last_group_ok, last_rank_state, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (discord_id)
+                DO UPDATE SET
+                    roblox_id = EXCLUDED.roblox_id,
+                    last_has_role = EXCLUDED.last_has_role,
+                    last_display_ok = EXCLUDED.last_display_ok,
+                    last_group_ok = EXCLUDED.last_group_ok,
+                    last_rank_state = EXCLUDED.last_rank_state,
+                    updated_at = NOW()
+            """, (discord_id, roblox_id, has_role_flag, display_ok, group_ok, rank_state))
+            conn.commit()
+
+def get_member_state(discord_id):
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM member_state WHERE discord_id = %s", (discord_id,))
+            return cur.fetchone()
+
+def get_all_applications():
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT discord_id, roblox_id FROM applications")
             return cur.fetchall()
 
 # ---------------- ROLE ----------------
 def has_role(member, role_id):
     return any(r.id == role_id for r in member.roles)
 
-# ---------------- ROBLOX HTTP ----------------
+# ---------------- HTTP / ROBLOX ----------------
 def safe_request(method, url, **kwargs):
     kwargs.setdefault("timeout", REQUEST_TIMEOUT)
     try:
-        response = requests.request(method, url, **kwargs)
-        return response
-    except requests.RequestException:
+        return requests.request(method, url, **kwargs)
+    except requests.RequestException as e:
+        print(f"[HTTP ERROR] {method} {url} -> {e}")
         return None
 
 def patch_with_csrf(url, json_data):
@@ -161,7 +246,7 @@ def patch_with_csrf(url, json_data):
         return None
 
     if r.status_code == 403:
-        token = r.headers.get("x-csrf-token")
+        token = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
         if token:
             headers["X-CSRF-TOKEN"] = token
             r = safe_request("PATCH", url, headers=headers, json=json_data)
@@ -172,15 +257,12 @@ def get_user_id(username):
     r = safe_request(
         "POST",
         "https://users.roblox.com/v1/usernames/users",
-        json={
-            "usernames": [username],
-            "excludeBannedUsers": True
-        }
+        json={"usernames": [username], "excludeBannedUsers": True}
     )
     if r and r.status_code == 200:
         data = r.json().get("data", [])
         if data:
-            return data[0]["id"]
+            return int(data[0]["id"])
     return None
 
 def get_user_profile(user_id):
@@ -200,14 +282,22 @@ def set_rank(user_id):
         f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}",
         {"roleId": RANK_ID}
     )
-    return r is not None and r.status_code == 200
+    if r is None:
+        print(f"[ROBLOX] set_rank failed for {user_id}: no response")
+        return False
+    print(f"[ROBLOX] set_rank {user_id}: {r.status_code} {r.text[:300]}")
+    return r.status_code in (200, 204)
 
 def rank_down(user_id):
     r = patch_with_csrf(
         f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}",
         {"roleId": DEMOTE_RANK_ID}
     )
-    return r is not None and r.status_code == 200
+    if r is None:
+        print(f"[ROBLOX] rank_down failed for {user_id}: no response")
+        return False
+    print(f"[ROBLOX] rank_down {user_id}: {r.status_code} {r.text[:300]}")
+    return r.status_code in (200, 204)
 
 # ---------------- EMBED ----------------
 def embed(title, desc, color):
@@ -221,20 +311,28 @@ def embed(title, desc, color):
     return e
 
 async def send_log(guild, title, desc, color):
-    if not guild:
+    if guild is None:
+        print("[LOG] No guild provided")
         return
+
     ch = guild.get_channel(LOG_CHANNEL_ID)
-    if ch:
+    if ch is None:
         try:
-            await ch.send(embed=embed(title, desc, color))
-        except Exception:
-            pass
+            ch = await bot.fetch_channel(LOG_CHANNEL_ID)
+        except Exception as e:
+            print(f"[LOG ERROR] fetch_channel failed: {e}")
+            return
+
+    try:
+        await ch.send(embed=embed(title, desc, color))
+    except Exception as e:
+        print(f"[LOG ERROR] send failed: {e}")
 
 async def send_dm(user, embed_msg):
     try:
         await user.send(embed=embed_msg)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[DM ERROR] Could not DM {getattr(user, 'id', 'unknown')}: {e}")
 
 # ---------------- HELPERS ----------------
 def get_cached_or_db_roblox_id(discord_id):
@@ -247,10 +345,61 @@ def get_cached_or_db_roblox_id(discord_id):
         user_links[discord_id] = roblox_id
     return roblox_id
 
-def get_guild_member_by_discord_id(guild, discord_id):
-    if not guild:
+def get_member_from_any_guild(discord_id):
+    for guild in bot.guilds:
+        member = guild.get_member(discord_id)
+        if member:
+            return guild, member
+    return None, None
+
+def parse_duration(duration_text):
+    text = duration_text.strip().lower()
+
+    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", text)
+    if not match:
         return None
-    return guild.get_member(discord_id)
+
+    amount = int(match.group(1))
+    unit = match.group(2)
+
+    if amount <= 0:
+        return None
+
+    if unit in ("min", "m"):
+        return timedelta(minutes=amount)
+    if unit == "h":
+        return timedelta(hours=amount)
+    if unit == "d":
+        return timedelta(days=amount)
+
+    return None
+
+def format_dt(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def display_name_ok(profile):
+    if not profile:
+        return False
+    return DISPLAY_REQUIRED_TEXT in profile.get("displayName", "").lower()
+
+def should_block_rerank(roblox_id):
+    if is_manual_demoted(roblox_id):
+        return True
+    if get_temp_demote(roblox_id):
+        return True
+    return False
+
+async def log_command(ctx, title, description, color):
+    await send_log(ctx.guild, title, description, color)
+
+async def dm_by_discord_id(discord_id, embed_msg):
+    if discord_id is None:
+        return
+    try:
+        user = await bot.fetch_user(discord_id)
+        await send_dm(user, embed_msg)
+    except Exception as e:
+        print(f"[DM ERROR] fetch_user failed for {discord_id}: {e}")
 
 # ---------------- /turfapply ----------------
 @bot.slash_command(name="turfapply")
@@ -259,60 +408,91 @@ async def turfapply(ctx, username: str):
     member = ctx.author
 
     if not has_role(member, ALLOWED_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ Access Denied", "Missing role.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /turfapply DENIED",
+            f"User: {member} ({member.id})\nUsername: {username}\nReason: Missing role",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ Access Denied", "Missing role.", discord.Color.red()))
 
     if has_applied(member.id):
-        return await ctx.respond(
-            embed=embed("⚠️ Already Applied", "You already applied.", discord.Color.orange())
+        await log_command(
+            ctx,
+            "⚠️ /turfapply BLOCKED",
+            f"User: {member} ({member.id})\nUsername: {username}\nReason: Already applied",
+            discord.Color.orange()
         )
+        return await ctx.respond(embed=embed("⚠️ Already Applied", "You already applied.", discord.Color.orange()))
 
     user_id = get_user_id(username)
     if not user_id:
-        return await ctx.respond(
-            embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /turfapply FAILED",
+            f"User: {member} ({member.id})\nUsername: {username}\nReason: Invalid Roblox username",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid Roblox username.", discord.Color.red()))
 
     profile = get_user_profile(user_id)
     if not profile:
-        return await ctx.respond(
-            embed=embed("❌ Error", "Could not fetch profile.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /turfapply FAILED",
+            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Could not fetch profile",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ Error", "Could not fetch profile.", discord.Color.red()))
 
-    if "fl13" not in profile.get("displayName", "").lower():
-        return await ctx.respond(
-            embed=embed("❌ Invalid Display Name", "Your Roblox display must contain 'fl13'.", discord.Color.red())
+    if not display_name_ok(profile):
+        await log_command(
+            ctx,
+            "❌ /turfapply FAILED",
+            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Display name missing '{DISPLAY_REQUIRED_TEXT}'",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ Invalid Display Name", f"Your Roblox display must contain '{DISPLAY_REQUIRED_TEXT}'.", discord.Color.red()))
 
     if not is_in_group(user_id):
-        return await ctx.respond(
-            embed=embed("❌ Not In Group", "You must be in the Roblox group.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /turfapply FAILED",
+            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Not in Roblox group",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ Not In Group", "You must be in the Roblox group.", discord.Color.red()))
 
     if set_rank(user_id):
-        user_links[member.id] = user_id
         save_application(member.id, user_id)
+        user_links[member.id] = user_id
+        save_member_state(member.id, user_id, True, True, True, "ranked")
 
-        await ctx.respond(
-            embed=embed("✅ Accepted", f"You have been ranked as {RANK_NAME}!", discord.Color.green())
-        )
+        await ctx.respond(embed=embed("✅ Accepted", f"You have been ranked as {RANK_NAME}!", discord.Color.green()))
 
-        await send_log(
-            ctx.guild,
-            "🟢 APPLICATION APPROVED",
-            f"Discord: {member} ({member.id})\nRoblox ID: {user_id}\nUsername: {username}",
+        await log_command(
+            ctx,
+            "🟢 /turfapply SUCCESS",
+            f"User: {member} ({member.id})\nRoblox Username: {username}\nRoblox ID: {user_id}",
             discord.Color.green()
         )
 
         await send_dm(
             member,
-            embed("🎉 Welcome To The Turf", "You've been successfully ranked!", discord.Color.green())
+            embed(
+                "🎉 Welcome To The Turf",
+                f"You have been accepted and ranked as {RANK_NAME}.",
+                discord.Color.green()
+            )
         )
     else:
-        await ctx.respond(
-            embed=embed("❌ Rank Failed", "Could not set Roblox rank. Try again later.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /turfapply FAILED",
+            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
+            discord.Color.red()
         )
+        await ctx.respond(embed=embed("❌ Rank Failed", "Could not set Roblox rank. Try again later.", discord.Color.red()))
 
 # ---------------- /demote ----------------
 @bot.slash_command(name="demote")
@@ -321,152 +501,198 @@ async def demote(ctx, username: str, reason: str):
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ No Permission", "Missing role.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /demote DENIED",
+            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
 
     user_id = get_user_id(username)
     if not user_id:
-        return await ctx.respond(
-            embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /demote FAILED",
+            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
+
+    discord_id = get_discord_id_by_roblox(user_id)
 
     if rank_down(user_id):
         delete_temp_demote(user_id)
+        save_manual_demote(discord_id, user_id, username, reason, admin.id)
 
-        await ctx.respond(
-            embed=embed("📉 Demoted", f"{username}\nReason: {reason}", discord.Color.orange())
-        )
+        if discord_id is not None:
+            save_member_state(discord_id, user_id, True, True, True, "manual_demoted")
 
-        await send_log(
-            ctx.guild,
-            "🔴 MANUAL DEMOTE",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: {reason}",
+        await ctx.respond(embed=embed("📉 Demoted", f"{username}\nReason: {reason}", discord.Color.orange()))
+
+        await log_command(
+            ctx,
+            "🔴 /demote SUCCESS",
+            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nReason: {reason}",
             discord.Color.red()
         )
+
+        if discord_id is not None:
+            await dm_by_discord_id(
+                discord_id,
+                embed(
+                    "🔴 You Have Been Permanently Demoted",
+                    f"You have been demoted from The Turf.\n\nReason: {reason}\nDuration: Permanent",
+                    discord.Color.red()
+                )
+            )
     else:
-        await ctx.respond(
-            embed=embed("❌ Demote Failed", "Could not change Roblox rank.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /demote FAILED",
+            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
+            discord.Color.red()
         )
+        await ctx.respond(embed=embed("❌ Demote Failed", "Could not change Roblox rank.", discord.Color.red()))
 
 # ---------------- /tempdemote ----------------
 @bot.slash_command(name="tempdemote")
-async def tempdemote(ctx, username: str, minutes: int):
+async def tempdemote(ctx, username: str, duration: str, reason: str):
     await ctx.defer()
     admin = ctx.author
 
     if not has_role(admin, DEMOTE_ROLE_ID):
-        return await ctx.respond(
-            embed=embed("❌ No Permission", "Missing role.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /tempdemote DENIED",
+            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ No Permission", "Missing role.", discord.Color.red()))
 
-    if minutes <= 0:
-        return await ctx.respond(
-            embed=embed("❌ Invalid Duration", "Minutes must be greater than 0.", discord.Color.red())
+    delta = parse_duration(duration)
+    if delta is None:
+        await log_command(
+            ctx,
+            "❌ /tempdemote FAILED",
+            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid duration '{duration}'",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ Invalid Duration", "Use for example: 1min, 5min, 1h, 12h, 1d", discord.Color.red()))
 
     user_id = get_user_id(username)
     if not user_id:
-        return await ctx.respond(
-            embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red())
+        await log_command(
+            ctx,
+            "❌ /tempdemote FAILED",
+            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
+            discord.Color.red()
         )
+        return await ctx.respond(embed=embed("❌ User Not Found", "Invalid username.", discord.Color.red()))
 
-    profile = get_user_profile(user_id)
-    discord_id = None
-
-    # Try to find matching discord_id from existing applications
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT discord_id FROM applications WHERE roblox_id = %s", (user_id,))
-            row = cur.fetchone()
-            if row:
-                discord_id = int(row[0])
+    discord_id = get_discord_id_by_roblox(user_id)
+    expires_at = datetime.now(timezone.utc) + delta
 
     if rank_down(user_id):
-        expires_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
-        save_temp_demote(discord_id, user_id, username, expires_at, admin.id)
+        save_temp_demote(discord_id, user_id, username, reason, duration, expires_at, admin.id)
 
-        await ctx.respond(
-            embed=embed("⏳ Temp Demoted", f"{username} for {minutes} minutes", discord.Color.orange())
-        )
+        if discord_id is not None:
+            save_member_state(discord_id, user_id, True, True, True, "temp_demoted")
 
-        await send_log(
-            ctx.guild,
-            "🟡 TEMP DEMOTE",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nDuration: {minutes} min\nExpires: {expires_at.isoformat()}",
+        await ctx.respond(embed=embed("⏳ Temp Demoted", f"{username}\nDuration: {duration}\nReason: {reason}", discord.Color.orange()))
+
+        await log_command(
+            ctx,
+            "🟡 /tempdemote SUCCESS",
+            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nDuration: {duration}\nExpires: {format_dt(expires_at)}\nReason: {reason}",
             discord.Color.orange()
         )
-    else:
-        await ctx.respond(
-            embed=embed("❌ Temp Demote Failed", "Could not change Roblox rank.", discord.Color.red())
-        )
 
+        if discord_id is not None:
+            await dm_by_discord_id(
+                discord_id,
+                embed(
+                    "🟡 You Have Been Temporarily Demoted",
+                    f"You have been temporarily demoted from The Turf.\n\nReason: {reason}\nDuration: {duration}\nEnds: {format_dt(expires_at)}",
+                    discord.Color.orange()
+                )
+            )
+    else:
+        await log_command(
+            ctx,
+            "❌ /tempdemote FAILED",
+            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
+            discord.Color.red()
+        )
+        await ctx.respond(embed=embed("❌ Temp Demote Failed", "Could not change Roblox rank.", discord.Color.red()))
+
+# ---------------- TEMP DEMOTE EXPIRY ----------------
 async def process_expired_temp_demotions():
     expired = get_expired_temp_demotions()
     if not expired:
         return
 
     for item in expired:
+        roblox_id = int(item["roblox_id"])
         discord_id = item["discord_id"]
-        roblox_id = item["roblox_id"]
         username = item["username"]
+        reason = item["reason"]
+        duration_text = item["duration_text"]
 
-        should_rerank = True
-        guilds = bot.guilds
-
+        guild = None
         member = None
-        guild_found = None
 
         if discord_id is not None:
-            for guild in guilds:
-                member = get_guild_member_by_discord_id(guild, discord_id)
-                if member:
-                    guild_found = guild
-                    break
-
-            if member is None:
-                should_rerank = False
-            elif not has_role(member, ALLOWED_ROLE_ID):
-                should_rerank = False
+            guild, member = get_member_from_any_guild(int(discord_id))
 
         profile = get_user_profile(roblox_id)
-        if not profile or "fl13" not in profile.get("displayName", "").lower():
-            should_rerank = False
+        display_ok = display_name_ok(profile)
+        group_ok = is_in_group(roblox_id)
+        has_role_flag = member is not None and has_role(member, ALLOWED_ROLE_ID)
+        blocked = is_manual_demoted(roblox_id)
 
-        if should_rerank and set_rank(roblox_id):
-            if guild_found:
+        if not blocked and has_role_flag and display_ok and group_ok and set_rank(roblox_id):
+            if guild:
                 await send_log(
-                    guild_found,
-                    "🟢 TEMP DEMOTE EXPIRED",
-                    f"{username} has been re-ranked",
+                    guild,
+                    "🟢 TEMP DEMOTE ENDED",
+                    f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nOriginal reason: {reason}\nOriginal duration: {duration_text}",
                     discord.Color.green()
                 )
-            if member:
-                await send_dm(
-                    member,
+
+            if discord_id is not None:
+                await dm_by_discord_id(
+                    int(discord_id),
                     embed(
-                        "🎉 Temp Demote Expired",
-                        "Your access has been restored.",
+                        "🟢 Temp Demotion Ended",
+                        f"Your temporary demotion has ended and your access has been restored.\n\nPrevious reason: {reason}\nPrevious duration: {duration_text}",
                         discord.Color.green()
                     )
                 )
+
+            if discord_id is not None:
+                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
         else:
-            if guild_found:
+            if guild:
                 await send_log(
-                    guild_found,
-                    "🔴 TEMP RE-RANK DENIED",
-                    f"{username} was not re-ranked because one or more checks failed.",
+                    guild,
+                    "🔴 TEMP DEMOTE ENDED - NO RE-RANK",
+                    f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nBlocked manual demote: {blocked}\nHas role: {has_role_flag}\nDisplay ok: {display_ok}\nGroup ok: {group_ok}",
                     discord.Color.red()
                 )
-            if member:
-                await send_dm(
-                    member,
+
+            if discord_id is not None:
+                await dm_by_discord_id(
+                    int(discord_id),
                     embed(
-                        "❌ Temp Re-Rank Failed",
-                        "Your temp demotion expired, but you no longer meet the requirements for restoration.",
+                        "🔴 Temp Demotion Ended - Access Not Restored",
+                        "Your temporary demotion has ended, but your access was not restored because one or more requirements are not currently met.",
                         discord.Color.red()
                     )
                 )
+
+            if discord_id is not None:
+                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "deranked")
 
         delete_temp_demote(roblox_id)
 
@@ -474,84 +700,123 @@ async def process_expired_temp_demotions():
 async def temp_demote_checker():
     await process_expired_temp_demotions()
 
-# ---------------- AUTO DEMOTE + AUTO RE-RANK ----------------
+# ---------------- MEMBER STATUS CHECKER ----------------
+async def evaluate_member_access(discord_id, roblox_id):
+    guild, member = get_member_from_any_guild(int(discord_id))
+    if guild is None or member is None:
+        return
+
+    profile = get_user_profile(roblox_id)
+    has_role_flag = has_role(member, ALLOWED_ROLE_ID)
+    display_ok = display_name_ok(profile)
+    group_ok = is_in_group(roblox_id)
+
+    prev = get_member_state(int(discord_id))
+    prev_rank_state = prev["last_rank_state"] if prev else "unknown"
+
+    blocked_manual = is_manual_demoted(roblox_id)
+    blocked_temp = get_temp_demote(roblox_id) is not None
+
+    eligible_for_rank = has_role_flag and display_ok and group_ok and not blocked_manual and not blocked_temp
+
+    if eligible_for_rank:
+        if prev_rank_state != "ranked":
+            if set_rank(roblox_id):
+                await send_log(
+                    guild,
+                    "🟢 AUTO RE-RANK",
+                    f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Role/display/group requirements restored",
+                    discord.Color.green()
+                )
+                await send_dm(
+                    member,
+                    embed(
+                        "🎉 You Have Been Re-Ranked",
+                        "Your required role/display conditions are now valid again, and your access has been restored in The Turf.",
+                        discord.Color.green()
+                    )
+                )
+                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
+                return
+            else:
+                await send_log(
+                    guild,
+                    "❌ AUTO RE-RANK FAILED",
+                    f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Rank API failed",
+                    discord.Color.red()
+                )
+                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "deranked")
+                return
+
+        save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
+        return
+
+    if prev_rank_state != "deranked" and prev_rank_state != "manual_demoted" and prev_rank_state != "temp_demoted":
+        if rank_down(roblox_id):
+            reason_parts = []
+            if not has_role_flag:
+                reason_parts.append("required Discord role missing")
+            if not display_ok:
+                reason_parts.append(f"Roblox display name missing '{DISPLAY_REQUIRED_TEXT}'")
+            if not group_ok:
+                reason_parts.append("not in Roblox group")
+            if blocked_manual:
+                reason_parts.append("manually demoted")
+            if blocked_temp:
+                reason_parts.append("temporary demotion active")
+
+            reason_text = ", ".join(reason_parts) if reason_parts else "requirements not met"
+
+            await send_log(
+                guild,
+                "🟠 AUTO DERANK",
+                f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: {reason_text}",
+                discord.Color.orange()
+            )
+
+            if not blocked_manual and not blocked_temp:
+                await send_dm(
+                    member,
+                    embed(
+                        "⚠️ Your Access Has Been Revoked",
+                        f"You were deranked from The Turf because: {reason_text}. When the required conditions are restored, your access can be restored automatically.",
+                        discord.Color.red()
+                    )
+                )
+
+    new_state = "deranked"
+    if blocked_manual:
+        new_state = "manual_demoted"
+    elif blocked_temp:
+        new_state = "temp_demoted"
+
+    save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, new_state)
+
+@tasks.loop(minutes=2)
+async def member_status_checker():
+    apps = get_all_applications()
+    for item in apps:
+        discord_id = int(item["discord_id"])
+        roblox_id = int(item["roblox_id"])
+        try:
+            await evaluate_member_access(discord_id, roblox_id)
+        except Exception as e:
+            print(f"[STATUS CHECK ERROR] discord_id={discord_id}, roblox_id={roblox_id} -> {e}")
+
+# ---------------- MEMBER UPDATE EVENT ----------------
 @bot.event
 async def on_member_update(before, after):
     before_roles = [r.id for r in before.roles]
     after_roles = [r.id for r in after.roles]
 
-    # AUTO DEMOTE
-    if ALLOWED_ROLE_ID in before_roles and ALLOWED_ROLE_ID not in after_roles:
+    # Immediate role change reaction
+    if (ALLOWED_ROLE_ID in before_roles) != (ALLOWED_ROLE_ID in after_roles):
         roblox_id = get_cached_or_db_roblox_id(after.id)
-
         if roblox_id:
-            if rank_down(roblox_id):
-                await send_log(
-                    after.guild,
-                    "🟠 AUTO DEMOTE",
-                    f"{after} lost role\nRoblox ID: {roblox_id}",
-                    discord.Color.orange()
-                )
-
-                user_obj = await bot.fetch_user(after.id)
-                await send_dm(
-                    user_obj,
-                    embed(
-                        "⚠️ You Have Been Demoted From The Turf",
-                        "Due to losing your required Discord role, your access has been revoked.",
-                        discord.Color.red()
-                    )
-                )
-
-    # AUTO RE-RANK WITH DISPLAY CHECK
-    if ALLOWED_ROLE_ID not in before_roles and ALLOWED_ROLE_ID in after_roles:
-        roblox_id = get_cached_or_db_roblox_id(after.id)
-
-        if roblox_id:
-            profile = get_user_profile(roblox_id)
-
-            if profile and "fl13" in profile.get("displayName", "").lower():
-                if set_rank(roblox_id):
-                    await send_log(
-                        after.guild,
-                        "🟢 AUTO RE-RANK",
-                        f"{after} regained role and passed display check\nRoblox ID: {roblox_id}",
-                        discord.Color.green()
-                    )
-
-                    user_obj = await bot.fetch_user(after.id)
-                    await send_dm(
-                        user_obj,
-                        embed(
-                            "🎉 You Have Been Re-Ranked",
-                            "Your access has been restored in The Turf.",
-                            discord.Color.green()
-                        )
-                    )
-                else:
-                    await send_log(
-                        after.guild,
-                        "🔴 AUTO RE-RANK FAILED",
-                        f"{after} regained role and passed checks, but rank update failed.\nRoblox ID: {roblox_id}",
-                        discord.Color.red()
-                    )
-            else:
-                await send_log(
-                    after.guild,
-                    "🔴 RE-RANK DENIED",
-                    f"{after} regained role but failed display check\nRoblox ID: {roblox_id}",
-                    discord.Color.red()
-                )
-
-                user_obj = await bot.fetch_user(after.id)
-                await send_dm(
-                    user_obj,
-                    embed(
-                        "❌ Re-Rank Failed",
-                        "Your Roblox display name must contain 'fl13' to regain access.",
-                        discord.Color.red()
-                    )
-                )
+            try:
+                await evaluate_member_access(after.id, roblox_id)
+            except Exception as e:
+                print(f"[on_member_update ERROR] {after.id} -> {e}")
 
 # ---------------- READY ----------------
 @bot.event
@@ -562,6 +827,9 @@ async def on_ready():
 
         if not temp_demote_checker.is_running():
             temp_demote_checker.start()
+
+        if not member_status_checker.is_running():
+            member_status_checker.start()
 
         print(f"Bot online: {bot.user}")
         print(f"Loaded {len(user_links)} user links from database.")
