@@ -980,6 +980,8 @@ async def evaluate_member_access(discord_id, roblox_id):
 
     prev = get_member_state(int(discord_id))
     prev_rank_state = prev["last_rank_state"] if prev else "unknown"
+    prev_has_role = prev["last_has_role"] if prev else None
+    prev_display_ok = prev["last_display_ok"] if prev else None
 
     blocked_manual = is_manual_demoted(roblox_id)
     blocked_temp = get_temp_demote(roblox_id) is not None
@@ -988,6 +990,14 @@ async def evaluate_member_access(discord_id, roblox_id):
 
     if eligible_for_rank:
         if prev_rank_state != "ranked":
+            restored_reason = "Your access has been restored because your requirements are valid again."
+            if prev_has_role is False and prev_display_ok is False:
+                restored_reason = "Your access has been restored because your Discord role is back and your Roblox display name now includes 'fl13' again."
+            elif prev_has_role is False:
+                restored_reason = "Your access has been restored because your required Discord role is back."
+            elif prev_display_ok is False:
+                restored_reason = "Your access has been restored because your Roblox display name now includes 'fl13' again."
+
             if set_rank(roblox_id):
                 await send_log(
                     guild,
@@ -998,8 +1008,8 @@ async def evaluate_member_access(discord_id, roblox_id):
                 await send_dm(
                     member,
                     embed(
-                        "You Have Been Re-Ranked",
-                        "Your required role/display conditions are now valid again, and your access has been restored in The Turf.",
+                        "Your Access Has Been Restored",
+                        restored_reason,
                         SUCCESS_COLOR
                     )
                 )
@@ -1042,11 +1052,21 @@ async def evaluate_member_access(discord_id, roblox_id):
             )
 
             if not blocked_manual and not blocked_temp:
+                dm_reason = "You have been demoted from Turf because your requirements are no longer valid."
+                if not has_role_flag and not display_ok:
+                    dm_reason = "You have been demoted from Turf because you lost the required Discord role and your Roblox display name no longer includes 'fl13'."
+                elif not has_role_flag:
+                    dm_reason = "You have been demoted from Turf because you no longer have the required Discord role."
+                elif not display_ok:
+                    dm_reason = "You have been demoted from Turf because your Roblox display name no longer includes 'fl13'."
+                elif not group_ok:
+                    dm_reason = "You have been demoted from Turf because you are no longer in the Roblox group."
+
                 await send_dm(
                     member,
                     embed(
-                        "Your Access Has Been Revoked",
-                        f"You were deranked from The Turf because: {reason_text}. When the required conditions are restored, your access can be restored automatically.",
+                        "You Have Been Demoted From Turf",
+                        dm_reason,
                         FAIL_COLOR
                     )
                 )
