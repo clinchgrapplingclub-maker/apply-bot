@@ -1,1125 +1,1704 @@
-import discord
-from discord.ext import commands, tasks
+import aiohttp
+import base64
+import io
 import os
 import re
-import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from datetime import datetime, timedelta, timezone
+import sqlite3
+from datetime import datetime, timezone
+from typing import Optional
+
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not TOKEN:
+    raise RuntimeError("DISCORD_TOKEN is not set in Railway variables.")
 
 intents = discord.Intents.default()
-intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.guilds = True
+intents.members = False
+intents.message_content = True
 
-# ---------------- ENV ----------------
-def get_env(name, required=True, cast=None, default=None):
-    value = os.getenv(name, default)
-    if required and (value is None or str(value).strip() == ""):
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    if cast and value is not None:
-        try:
-            return cast(value)
-        except Exception:
-            raise RuntimeError(f"Invalid value for environment variable: {name}")
-    return value
+bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
 
-DISCORD_TOKEN = get_env("DISCORD_BOT_TOKEN")
-ALLOWED_ROLE_ID = get_env("ALLOWED_ROLE_ID", cast=int)
-ROBLOX_COOKIE = get_env("ROBLOX_COOKIE")
-GROUP_ID = get_env("GROUP_ID", cast=int)
-RANK_ID = get_env("RANK_1", cast=int)
-RANK_NAME = "Full Access"
-DATABASE_URL = get_env("DATABASE_URL")
+DB_PATH = "ticketbot.db"
 
-DEMOTE_ROLE_ID = get_env("DEMOTE_ROLE_ID", cast=int)
-DEMOTE_RANK_ID = get_env("DEMOTE_RANK_ID", cast=int)
-LOG_CHANNEL_ID = get_env("LOG_CHANNEL_ID", cast=int)
+SKIP_WORDS = {"skip", "none", "no", "-"}
+CANCEL_WORDS = {"cancel", "stop", "abort", "exit"}
 
-REQUEST_TIMEOUT = 15
-DISPLAY_REQUIRED_TEXT = "fl13"
 
-SUCCESS_COLOR = discord.Color.from_rgb(255, 255, 255)  # white
-FAIL_COLOR = discord.Color.from_rgb(0, 0, 0)           # black
+# =========================
+# DATABASE
+# =========================
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-roblox_headers = {
-    "Content-Type": "application/json",
-    "Cookie": f".ROBLOSECURITY={ROBLOX_COOKIE}"
-}
-
-# Cache only, DB is source of truth
-user_links = {}
-
-# ---------------- DB ----------------
-def get_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS applications (
-                    discord_id BIGINT PRIMARY KEY,
-                    roblox_id BIGINT NOT NULL UNIQUE,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS temp_demotions (
-                    roblox_id BIGINT PRIMARY KEY,
-                    discord_id BIGINT,
-                    username TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    duration_text TEXT NOT NULL,
-                    expires_at TIMESTAMPTZ NOT NULL,
-                    created_by BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS manual_demotions (
-                    roblox_id BIGINT PRIMARY KEY,
-                    discord_id BIGINT,
-                    username TEXT NOT NULL,
-                    reason TEXT NOT NULL,
-                    created_by BIGINT,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS member_state (
-                    discord_id BIGINT PRIMARY KEY,
-                    roblox_id BIGINT NOT NULL,
-                    last_has_role BOOLEAN NOT NULL DEFAULT FALSE,
-                    last_display_ok BOOLEAN NOT NULL DEFAULT FALSE,
-                    last_group_ok BOOLEAN NOT NULL DEFAULT FALSE,
-                    last_rank_state TEXT NOT NULL DEFAULT 'unknown',
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-            """)
-            conn.commit()
+    conn = db()
+    cur = conn.cursor()
 
-def has_applied(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM applications WHERE discord_id = %s", (discord_id,))
-            return cur.fetchone() is not None
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS guild_config (
+            guild_id INTEGER PRIMARY KEY,
+            panel_channel_id INTEGER NOT NULL,
+            panel_message_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            color_hex TEXT NOT NULL,
+            banner_url TEXT,
+            thumbnail_url TEXT,
+            support_role_id INTEGER NOT NULL,
+            log_channel_id INTEGER NOT NULL
+        )
+    """)
 
-def save_application(discord_id, roblox_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO applications (discord_id, roblox_id)
-                VALUES (%s, %s)
-                ON CONFLICT (discord_id)
-                DO UPDATE SET roblox_id = EXCLUDED.roblox_id
-            """, (discord_id, roblox_id))
-            conn.commit()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ticket_options (
+            guild_id INTEGER NOT NULL,
+            option_index INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            category_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, option_index)
+        )
+    """)
 
-def reset_application(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM applications WHERE discord_id = %s", (discord_id,))
-            conn.commit()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tickets (
+            channel_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            opener_id INTEGER NOT NULL,
+            option_label TEXT NOT NULL,
+            status TEXT NOT NULL,
+            claimed_by INTEGER,
+            created_at TEXT NOT NULL,
+            closed_at TEXT
+        )
+    """)
 
-def get_roblox_id_by_discord(discord_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT roblox_id FROM applications WHERE discord_id = %s", (discord_id,))
-            row = cur.fetchone()
-            return int(row[0]) if row else None
+    conn.commit()
+    conn.close()
 
-def get_discord_id_by_roblox(roblox_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT discord_id FROM applications WHERE roblox_id = %s", (roblox_id,))
-            row = cur.fetchone()
-            return int(row[0]) if row and row[0] is not None else None
 
-def load_user_links():
-    global user_links
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT discord_id, roblox_id FROM applications")
-            rows = cur.fetchall()
-            user_links = {int(d): int(r) for d, r in rows}
+def save_guild_config(
+    guild_id: int,
+    panel_channel_id: int,
+    panel_message_id: int,
+    title: str,
+    description: str,
+    color_hex: str,
+    banner_url: Optional[str],
+    thumbnail_url: Optional[str],
+    support_role_id: int,
+    log_channel_id: int,
+):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO guild_config (
+            guild_id, panel_channel_id, panel_message_id, title, description,
+            color_hex, banner_url, thumbnail_url, support_role_id, log_channel_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(guild_id) DO UPDATE SET
+            panel_channel_id=excluded.panel_channel_id,
+            panel_message_id=excluded.panel_message_id,
+            title=excluded.title,
+            description=excluded.description,
+            color_hex=excluded.color_hex,
+            banner_url=excluded.banner_url,
+            thumbnail_url=excluded.thumbnail_url,
+            support_role_id=excluded.support_role_id,
+            log_channel_id=excluded.log_channel_id
+    """, (
+        guild_id, panel_channel_id, panel_message_id, title, description,
+        color_hex, banner_url, thumbnail_url, support_role_id, log_channel_id
+    ))
+    conn.commit()
+    conn.close()
 
-def save_temp_demote(discord_id, roblox_id, username, reason, duration_text, expires_at, created_by):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO temp_demotions (roblox_id, discord_id, username, reason, duration_text, expires_at, created_by)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (roblox_id)
-                DO UPDATE SET
-                    discord_id = EXCLUDED.discord_id,
-                    username = EXCLUDED.username,
-                    reason = EXCLUDED.reason,
-                    duration_text = EXCLUDED.duration_text,
-                    expires_at = EXCLUDED.expires_at,
-                    created_by = EXCLUDED.created_by
-            """, (roblox_id, discord_id, username, reason, duration_text, expires_at, created_by))
-            conn.commit()
 
-def get_temp_demote(roblox_id):
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM temp_demotions WHERE roblox_id = %s", (roblox_id,))
-            return cur.fetchone()
+def get_guild_config(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM guild_config WHERE guild_id = ?", (guild_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-def delete_temp_demote(roblox_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM temp_demotions WHERE roblox_id = %s", (roblox_id,))
-            conn.commit()
 
-def get_expired_temp_demotions():
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM temp_demotions WHERE expires_at <= NOW()")
-            return cur.fetchall()
+def clear_ticket_options(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM ticket_options WHERE guild_id = ?", (guild_id,))
+    conn.commit()
+    conn.close()
 
-def save_manual_demote(discord_id, roblox_id, username, reason, created_by):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO manual_demotions (roblox_id, discord_id, username, reason, created_by)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (roblox_id)
-                DO UPDATE SET
-                    discord_id = EXCLUDED.discord_id,
-                    username = EXCLUDED.username,
-                    reason = EXCLUDED.reason,
-                    created_by = EXCLUDED.created_by
-            """, (roblox_id, discord_id, username, reason, created_by))
-            conn.commit()
 
-def delete_manual_demote(roblox_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM manual_demotions WHERE roblox_id = %s", (roblox_id,))
-            conn.commit()
+def save_ticket_option(guild_id: int, option_index: int, label: str, category_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ticket_options (guild_id, option_index, label, category_id)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, option_index) DO UPDATE SET
+            label=excluded.label,
+            category_id=excluded.category_id
+    """, (guild_id, option_index, label, category_id))
+    conn.commit()
+    conn.close()
 
-def is_manual_demoted(roblox_id):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM manual_demotions WHERE roblox_id = %s", (roblox_id,))
-            return cur.fetchone() is not None
 
-def save_member_state(discord_id, roblox_id, has_role_flag, display_ok, group_ok, rank_state):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO member_state (discord_id, roblox_id, last_has_role, last_display_ok, last_group_ok, last_rank_state, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (discord_id)
-                DO UPDATE SET
-                    roblox_id = EXCLUDED.roblox_id,
-                    last_has_role = EXCLUDED.last_has_role,
-                    last_display_ok = EXCLUDED.last_display_ok,
-                    last_group_ok = EXCLUDED.last_group_ok,
-                    last_rank_state = EXCLUDED.last_rank_state,
-                    updated_at = NOW()
-            """, (discord_id, roblox_id, has_role_flag, display_ok, group_ok, rank_state))
-            conn.commit()
+def get_ticket_options(guild_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM ticket_options
+        WHERE guild_id = ?
+        ORDER BY option_index ASC
+    """, (guild_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-def get_member_state(discord_id):
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT * FROM member_state WHERE discord_id = %s", (discord_id,))
-            return cur.fetchone()
 
-def get_all_applications():
-    with get_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("SELECT discord_id, roblox_id FROM applications")
-            return cur.fetchall()
+def create_ticket_record(channel_id: int, guild_id: int, opener_id: int, option_label: str):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tickets (
+            channel_id, guild_id, opener_id, option_label, status,
+            claimed_by, created_at, closed_at
+        )
+        VALUES (?, ?, ?, ?, 'open', NULL, ?, NULL)
+    """, (
+        channel_id, guild_id, opener_id, option_label,
+        datetime.now(timezone.utc).isoformat()
+    ))
+    conn.commit()
+    conn.close()
 
-# ---------------- ROLE ----------------
-def has_role(member, role_id):
-    return any(r.id == role_id for r in member.roles)
 
-# ---------------- HTTP / ROBLOX ----------------
-def safe_request(method, url, **kwargs):
-    kwargs.setdefault("timeout", REQUEST_TIMEOUT)
-    try:
-        return requests.request(method, url, **kwargs)
-    except requests.RequestException as e:
-        print(f"[HTTP ERROR] {method} {url} -> {e}")
-        return None
+def get_ticket_by_channel(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM tickets WHERE channel_id = ?", (channel_id,))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-def patch_with_csrf(url, json_data):
-    headers = roblox_headers.copy()
-    r = safe_request("PATCH", url, headers=headers, json=json_data)
 
-    if r is None:
-        print("[ROBLOX] first patch got no response")
-        return None
+def get_open_ticket_for_user(guild_id: int, opener_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM tickets
+        WHERE guild_id = ? AND opener_id = ? AND status = 'open'
+        LIMIT 1
+    """, (guild_id, opener_id))
+    row = cur.fetchone()
+    conn.close()
+    return row
 
-    if r.status_code == 403:
-        token = r.headers.get("x-csrf-token") or r.headers.get("X-CSRF-TOKEN")
-        if token:
-            headers["X-CSRF-TOKEN"] = token
-            r = safe_request("PATCH", url, headers=headers, json=json_data)
 
-    return r
+def set_ticket_claimed(channel_id: int, claimed_by: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tickets
+        SET claimed_by = ?
+        WHERE channel_id = ?
+    """, (claimed_by, channel_id))
+    conn.commit()
+    conn.close()
 
-def get_user_id(username):
-    r = safe_request(
-        "POST",
-        "https://users.roblox.com/v1/usernames/users",
-        json={"usernames": [username], "excludeBannedUsers": True}
-    )
-    if r and r.status_code == 200:
-        data = r.json().get("data", [])
-        if data:
-            return int(data[0]["id"])
-    return None
 
-def get_user_profile(user_id):
-    if not user_id:
-        return None
-    r = safe_request("GET", f"https://users.roblox.com/v1/users/{user_id}")
-    return r.json() if r and r.status_code == 200 else None
+def close_ticket_record(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE tickets
+        SET status = 'closed', closed_at = ?
+        WHERE channel_id = ?
+    """, (datetime.now(timezone.utc).isoformat(), channel_id))
+    conn.commit()
+    conn.close()
 
-def is_in_group(user_id):
-    r = safe_request("GET", f"https://groups.roblox.com/v2/users/{user_id}/groups/roles")
-    if r and r.status_code == 200:
-        return any(g["group"]["id"] == GROUP_ID for g in r.json().get("data", []))
-    return False
 
-def get_user_group_role(user_id):
-    r = safe_request("GET", f"https://groups.roblox.com/v2/users/{user_id}/groups/roles")
-    if r and r.status_code == 200:
-        for g in r.json().get("data", []):
-            if g["group"]["id"] == GROUP_ID:
-                return g.get("role")
-    return None
+def delete_ticket_record(channel_id: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tickets WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
 
-def get_user_rank_in_group(user_id):
-    role = get_user_group_role(user_id)
-    if role:
-        return int(role["id"])
-    return None
 
-def get_user_role_name_in_group(user_id):
-    role = get_user_group_role(user_id)
-    if role:
-        return role.get("name", "Unknown")
-    return None
+# =========================
+# SETUP STATE
+# =========================
+class SetupCancelled(Exception):
+    pass
 
-def get_group_roles():
-    r = safe_request("GET", f"https://groups.roblox.com/v1/groups/{GROUP_ID}/roles")
-    if r and r.status_code == 200:
-        roles = r.json().get("roles", [])
-        return roles
-    return []
 
-def get_group_role_name_by_id(role_id):
-    roles = get_group_roles()
-    for role in roles:
-        if int(role["id"]) == int(role_id):
-            return role.get("name", "Unknown")
-    return "Unknown"
+class SetupData:
+    def __init__(self, guild_id: int, user_id: int, setup_channel_id: int):
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.setup_channel_id = setup_channel_id
 
-def set_rank_to_role(user_id, role_id):
-    r = patch_with_csrf(
-        f"https://groups.roblox.com/v1/groups/{GROUP_ID}/users/{user_id}",
-        {"roleId": int(role_id)}
-    )
-    if r is None:
-        print(f"[ROBLOX] set_rank_to_role failed for {user_id}: no response")
-        return False
-    print(f"[ROBLOX] set_rank_to_role status={r.status_code}")
-    print(f"[ROBLOX] set_rank_to_role body={r.text[:300]}")
-    return r.status_code in (200, 204)
+        self.title: Optional[str] = None
+        self.description: Optional[str] = None
+        self.color_hex: str = "#00FF66"
 
-def set_rank(user_id):
-    return set_rank_to_role(user_id, RANK_ID)
+        self.panel_channel_id: Optional[int] = None
+        self.support_role_id: Optional[int] = None
 
-def rank_down(user_id):
-    return set_rank_to_role(user_id, DEMOTE_RANK_ID)
+        self.option_1_name: Optional[str] = None
+        self.option_1_category_id: Optional[int] = None
 
-# ---------------- EMBED ----------------
-def embed(title, desc, color):
-    e = discord.Embed(
-        title=title,
-        description=desc,
-        color=color,
-        timestamp=datetime.now(timezone.utc)
-    )
-    e.set_footer(text="Designed And Created By @fntsheetz")
-    return e
+        self.option_2_name: Optional[str] = None
+        self.option_2_category_id: Optional[int] = None
 
-async def send_log(guild, title, desc, color):
-    if guild is None:
-        print("[LOG] No guild provided")
-        return
+        self.option_3_name: Optional[str] = None
+        self.option_3_category_id: Optional[int] = None
 
-    ch = guild.get_channel(LOG_CHANNEL_ID)
-    if ch is None:
-        try:
-            ch = await bot.fetch_channel(LOG_CHANNEL_ID)
-        except Exception as e:
-            print(f"[LOG ERROR] fetch_channel failed: {e}")
-            return
+        self.log_channel_id: Optional[int] = None
+        self.banner_url: Optional[str] = None
+        self.thumbnail_url: Optional[str] = None
 
-    try:
-        await ch.send(embed=embed(title, desc, color))
-    except Exception as e:
-        print(f"[LOG ERROR] send failed: {e}")
 
-async def send_dm(user, embed_msg):
-    try:
-        await user.send(embed=embed_msg)
-    except Exception as e:
-        print(f"[DM ERROR] Could not DM {getattr(user, 'id', 'unknown')}: {e}")
+active_setup_guilds: set[int] = set()
+active_setup_users: set[tuple[int, int]] = set()
+setup_sessions: dict[tuple[int, int], SetupData] = {}
 
-# ---------------- HELPERS ----------------
-def get_cached_or_db_roblox_id(discord_id):
-    roblox_id = user_links.get(discord_id)
-    if roblox_id:
-        return roblox_id
 
-    roblox_id = get_roblox_id_by_discord(discord_id)
-    if roblox_id:
-        user_links[discord_id] = roblox_id
-    return roblox_id
+# =========================
+# HELPERS
+# =========================
+def normalize_hex(value: str) -> str:
+    clean = value.strip().replace("#", "")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", clean):
+        raise ValueError("Invalid hex color.")
+    return f"#{clean.upper()}"
 
-def get_member_from_any_guild(discord_id):
-    for guild in bot.guilds:
-        member = guild.get_member(discord_id)
-        if member:
-            return guild, member
-    return None, None
 
-def parse_duration(duration_text):
-    text = duration_text.strip().lower()
-    match = re.fullmatch(r"(\d+)\s*(min|m|h|d)", text)
+def hex_to_color(value: str) -> discord.Color:
+    clean = value.replace("#", "")
+    return discord.Color(int(clean, 16))
+
+
+def clean_channel_name(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\- ]", "", text)
+    text = re.sub(r"\s+", "-", text).strip("-")
+    text = re.sub(r"-{2,}", "-", text)
+    return text[:80] if text else "ticket"
+
+
+def is_image_attachment(att: discord.Attachment) -> bool:
+    if att.content_type and att.content_type.startswith("image/"):
+        return True
+    filename = att.filename.lower()
+    return filename.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def extract_id(text: str) -> Optional[int]:
+    match = re.search(r"(\d{15,25})", text)
     if not match:
         return None
-
-    amount = int(match.group(1))
-    unit = match.group(2)
-
-    if amount <= 0:
+    try:
+        return int(match.group(1))
+    except ValueError:
         return None
 
-    if unit in ("min", "m"):
-        return timedelta(minutes=amount)
-    if unit == "h":
-        return timedelta(hours=amount)
-    if unit == "d":
-        return timedelta(days=amount)
 
-    return None
+def base_embed(
+    guild_id: Optional[int],
+    title: str,
+    description: str,
+    *,
+    error: bool = False
+) -> discord.Embed:
+    if error:
+        color = discord.Color.red()
+    else:
+        config = get_guild_config(guild_id) if guild_id else None
+        color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
 
-def format_dt(dt):
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
 
-def display_name_ok(profile):
-    if not profile:
-        return False
-    return DISPLAY_REQUIRED_TEXT in profile.get("displayName", "").lower()
 
-async def log_command(ctx, title, description, color):
-    await send_log(ctx.guild, title, description, color)
+def setup_embed(data: SetupData, title: str, description: str) -> discord.Embed:
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=hex_to_color(data.color_hex if data.color_hex else "#00FF66")
+    )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
 
-async def dm_by_discord_id(discord_id, embed_msg):
-    if discord_id is None:
-        return
-    try:
-        user = await bot.fetch_user(discord_id)
-        await send_dm(user, embed_msg)
-    except Exception as e:
-        print(f"[DM ERROR] fetch_user failed for {discord_id}: {e}")
 
-# ---------------- RANK VIEW ----------------
-class RankSelect(discord.ui.Select):
-    def __init__(self, ctx, target_username, target_user_id, target_discord_id, options_data):
-        self.ctx = ctx
-        self.target_username = target_username
-        self.target_user_id = target_user_id
-        self.target_discord_id = target_discord_id
-
-        options = []
-        for role in options_data[:25]:
-            options.append(
-                discord.SelectOption(
-                    label=role["name"][:100],
-                    value=str(role["id"]),
-                    description=f"Rank: {role.get('rank', 'N/A')}"[:100]
-                )
-            )
-
-        super().__init__(
-            placeholder="Choose a Roblox group rank",
-            min_values=1,
-            max_values=1,
-            options=options
+def build_panel_embed(guild_id: int) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    if not config:
+        return base_embed(
+            None,
+            "Ticket panel not configured",
+            "This server has not configured the ticket panel yet.",
+            error=True
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id != self.ctx.author.id:
-            return await interaction.response.send_message(
-                embed=embed("Not Allowed", "Only the command user can choose a rank.", FAIL_COLOR),
-                ephemeral=True
+    embed = discord.Embed(
+        title=config["title"],
+        description=config["description"],
+        color=hex_to_color(config["color_hex"])
+    )
+
+    if config["thumbnail_url"]:
+        embed.set_thumbnail(url=config["thumbnail_url"])
+
+    if config["banner_url"]:
+        embed.set_image(url=config["banner_url"])
+
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def build_ticket_embed(guild_id: int, option_label: str, opener: discord.Member) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title=option_label,
+        description=(
+            f"{opener.mention}, your ticket has been created.\n\n"
+            f"Please explain everything clearly.\n"
+            f"A member of the support team will reply here."
+        ),
+        color=color
+    )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def build_closed_ticket_embed(guild_id: int, closed_by: discord.Member) -> discord.Embed:
+    config = get_guild_config(guild_id)
+    color = hex_to_color(config["color_hex"]) if config else discord.Color.green()
+
+    embed = discord.Embed(
+        title="Ticket Closed",
+        description=f"Ticket closed by {closed_by.mention}.",
+        color=color
+    )
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+def is_support_or_admin(member: discord.Member, guild_id: int) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+
+    config = get_guild_config(guild_id)
+    if not config:
+        return False
+
+    role = member.guild.get_role(config["support_role_id"])
+    return role in member.roles if role else False
+
+
+def resolve_text_channel(guild: discord.Guild, raw: str) -> Optional[discord.TextChannel]:
+    cid = extract_id(raw)
+    if cid:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.TextChannel):
+            return ch
+
+    raw_clean = raw.strip().replace("#", "")
+    for ch in guild.text_channels:
+        if ch.name.lower() == raw_clean.lower():
+            return ch
+    return None
+
+
+def resolve_category(guild: discord.Guild, raw: str) -> Optional[discord.CategoryChannel]:
+    cid = extract_id(raw)
+    if cid:
+        ch = guild.get_channel(cid)
+        if isinstance(ch, discord.CategoryChannel):
+            return ch
+
+    raw_clean = raw.strip().replace("#", "")
+    for ch in guild.categories:
+        if ch.name.lower() == raw_clean.lower():
+            return ch
+    return None
+
+
+def resolve_role(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+    rid = extract_id(raw)
+    if rid:
+        role = guild.get_role(rid)
+        if role:
+            return role
+
+    raw_clean = raw.strip().replace("@", "")
+    for role in guild.roles:
+        if role.name.lower() == raw_clean.lower():
+            return role
+    return None
+
+
+async def safe_delete(message: Optional[discord.Message]):
+    if not message:
+        return
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def send_log(
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    file: Optional[discord.File] = None
+):
+    config = get_guild_config(guild.id)
+    if not config:
+        return
+
+    log_channel = guild.get_channel(config["log_channel_id"])
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+
+    embed = base_embed(guild.id, title, description)
+
+    try:
+        await log_channel.send(embed=embed, file=file)
+    except discord.Forbidden:
+        pass
+
+
+async def build_transcript_text(channel: discord.TextChannel) -> str:
+    lines = []
+    lines.append(f"Transcript for #{channel.name}")
+    lines.append(f"Channel ID: {channel.id}")
+    lines.append(f"Guild: {channel.guild.name} ({channel.guild.id})")
+    lines.append("-" * 80)
+
+    messages = [msg async for msg in channel.history(limit=None, oldest_first=True)]
+
+    for msg in messages:
+        created = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+        author = f"{msg.author} ({msg.author.id})"
+        content = msg.content if msg.content else ""
+
+        attachment_text = ""
+        if msg.attachments:
+            urls = ", ".join(att.url for att in msg.attachments)
+            attachment_text = f" [Attachments: {urls}]"
+
+        embed_text = ""
+        if msg.embeds:
+            embed_parts = []
+            for e in msg.embeds:
+                parts = []
+                if e.title:
+                    parts.append(f"title={e.title}")
+                if e.description:
+                    parts.append(f"description={e.description}")
+                if parts:
+                    embed_parts.append(" | ".join(parts))
+            if embed_parts:
+                embed_text = f" [Embeds: {' || '.join(embed_parts)}]"
+
+        lines.append(f"[{created}] {author}: {content}{attachment_text}{embed_text}")
+
+    return "\n".join(lines)
+
+
+async def set_guild_profile(
+    guild_id: int,
+    nickname: Optional[str] = None,
+    avatar_attachment: Optional[discord.Attachment] = None
+) -> tuple[bool, str]:
+    payload = {}
+
+    if nickname is not None:
+        payload["nick"] = nickname
+
+    if avatar_attachment is not None:
+        if not is_image_attachment(avatar_attachment):
+            return False, "Avatar attachment must be an image."
+
+        raw = await avatar_attachment.read()
+        mime = avatar_attachment.content_type or "image/png"
+        b64 = base64.b64encode(raw).decode("utf-8")
+        payload["avatar"] = f"data:{mime};base64,{b64}"
+
+    if not payload:
+        return False, "Nothing to update."
+
+    headers = {
+        "Authorization": f"Bot {TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    url = f"https://discord.com/api/v10/guilds/{guild_id}/members/@me"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.patch(url, json=payload, headers=headers) as resp:
+            if 200 <= resp.status < 300:
+                return True, "Guild profile updated successfully."
+
+            text = await resp.text()
+            return False, f"Discord API error {resp.status}: {text}"
+
+
+def build_setup_preview_embed(guild: discord.Guild, data: SetupData) -> discord.Embed:
+    color = hex_to_color(data.color_hex if data.color_hex else "#00FF66")
+
+    panel_channel = guild.get_channel(data.panel_channel_id) if data.panel_channel_id else None
+    support_role = guild.get_role(data.support_role_id) if data.support_role_id else None
+    log_channel = guild.get_channel(data.log_channel_id) if data.log_channel_id else None
+
+    cat1 = guild.get_channel(data.option_1_category_id) if data.option_1_category_id else None
+    cat2 = guild.get_channel(data.option_2_category_id) if data.option_2_category_id else None
+    cat3 = guild.get_channel(data.option_3_category_id) if data.option_3_category_id else None
+
+    embed = discord.Embed(
+        title=data.title or "Setup Preview",
+        description=data.description or "No description set.",
+        color=color
+    )
+
+    embed.add_field(
+        name="Panel Settings",
+        value=(
+            f"**Color:** `{data.color_hex}`\n"
+            f"**Panel Channel:** {panel_channel.mention if panel_channel else '`Not set`'}\n"
+            f"**Support Team:** {support_role.mention if support_role else '`Not set`'}\n"
+            f"**Log Channel:** {log_channel.mention if log_channel else '`Not set`'}"
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="Ticket Options",
+        value=(
+            f"**1.** {data.option_1_name or '`Not set`'} - {cat1.name if cat1 else '`Not set`'}\n"
+            f"**2.** {(data.option_2_name or '`Skipped`')} - {(cat2.name if cat2 else ('`Skipped`' if not data.option_2_name else '`Not set`'))}\n"
+            f"**3.** {(data.option_3_name or '`Skipped`')} - {(cat3.name if cat3 else ('`Skipped`' if not data.option_3_name else '`Not set`'))}"
+        ),
+        inline=False
+    )
+
+    if data.thumbnail_url:
+        embed.set_thumbnail(url=data.thumbnail_url)
+
+    if data.banner_url:
+        embed.set_image(url=data.banner_url)
+
+    embed.set_footer(text="made by @fntsheetz")
+    return embed
+
+
+# =========================
+# SETUP QUESTION FLOW
+# =========================
+async def wait_for_user_message(channel: discord.TextChannel, user: discord.Member, timeout: int = 300) -> discord.Message:
+    def check(m: discord.Message):
+        return (
+            m.author.id == user.id
+            and m.channel.id == channel.id
+            and not m.author.bot
+        )
+    return await bot.wait_for("message", check=check, timeout=timeout)
+
+
+async def ask_text(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+    *,
+    optional: bool = False,
+    multiline: bool = False,
+) -> Optional[str]:
+    prompt = await channel.send(embed=setup_embed(data, title, description))
+    reply = None
+    try:
+        reply = await wait_for_user_message(channel, user)
+        content = reply.content.strip()
+
+        if content.lower() in CANCEL_WORDS:
+            raise SetupCancelled()
+
+        if optional and content.lower() in SKIP_WORDS:
+            return None
+
+        if not content:
+            if optional:
+                return None
+            raise ValueError("Empty answer.")
+
+        return content
+    finally:
+        await safe_delete(prompt)
+        await safe_delete(reply)
+
+
+async def ask_role(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+) -> discord.Role:
+    while True:
+        raw = await ask_text(channel, user, data, title, description)
+        role = resolve_role(guild, raw)
+        if role:
+            return role
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Role",
+                "Could not find that role. Send a role mention, role ID, or exact role name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_text_channel(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+) -> discord.TextChannel:
+    while True:
+        raw = await ask_text(channel, user, data, title, description)
+        resolved = resolve_text_channel(guild, raw)
+        if resolved:
+            return resolved
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Channel",
+                "Could not find that text channel. Send a channel mention, channel ID, or exact channel name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_category(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    title: str,
+    description: str,
+    *,
+    optional: bool = False,
+) -> Optional[discord.CategoryChannel]:
+    while True:
+        raw = await ask_text(channel, user, data, title, description, optional=optional)
+        if raw is None:
+            return None
+
+        resolved = resolve_category(guild, raw)
+        if resolved:
+            return resolved
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Invalid Category",
+                "Could not find that category. Send the category ID or exact category name."
+            ),
+            delete_after=8
+        )
+
+
+async def ask_image(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    title: str,
+    description: str,
+) -> str:
+    prompt = await channel.send(embed=setup_embed(data, title, description))
+    reply = None
+
+    try:
+        reply = await wait_for_user_message(channel, user)
+
+        if reply.content.strip().lower() in CANCEL_WORDS:
+            raise SetupCancelled()
+
+        if not reply.attachments:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "No Image Found",
+                    "You need to upload an image in your reply."
+                ),
+                delete_after=8
             )
+            return await ask_image(channel, user, data, title, description)
 
-        selected_role_id = int(self.values[0])
-        selected_role_name = get_group_role_name_by_id(selected_role_id)
-        current_role_id = get_user_rank_in_group(self.target_user_id)
-        current_role_name = get_user_role_name_in_group(self.target_user_id)
+        attachment = reply.attachments[0]
+        if not is_image_attachment(attachment):
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Image",
+                    "Attachment must be an image."
+                ),
+                delete_after=8
+            )
+            return await ask_image(channel, user, data, title, description)
 
-        if current_role_id == selected_role_id:
-            return await interaction.response.send_message(
-                embed=embed(
-                    "Already That Rank",
-                    f"{self.target_username} is already ranked as {selected_role_name}.",
-                    FAIL_COLOR
+        return attachment.url
+    finally:
+        await safe_delete(prompt)
+        await safe_delete(reply)
+
+
+async def ask_option_name_and_category(
+    channel: discord.TextChannel,
+    user: discord.Member,
+    data: SetupData,
+    guild: discord.Guild,
+    number: int,
+    *,
+    optional: bool = False,
+) -> tuple[Optional[str], Optional[int]]:
+    prompt_title = f"Ticket Category {number}"
+    prompt_description = (
+        "Reply in this format:\n"
+        "`Ticket Name | Category Name or Category ID`\n\n"
+        "Example:\n"
+        "`Support Ticket | tickets`\n"
+        "`Purchase Ticket | 123456789012345678`\n\n"
+    )
+    if optional:
+        prompt_description += "Type `skip` if you do not want this option."
+
+    while True:
+        raw = await ask_text(
+            channel,
+            user,
+            data,
+            prompt_title,
+            prompt_description,
+            optional=optional
+        )
+        if raw is None:
+            return None, None
+
+        if "|" not in raw:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Format",
+                    "Use this exact format:\n`Ticket Name | Category Name or Category ID`"
+                ),
+                delete_after=8
+            )
+            continue
+
+        name_part, category_part = raw.split("|", 1)
+        name = name_part.strip()
+        category_raw = category_part.strip()
+
+        if not name or not category_raw:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Format",
+                    "Both ticket name and category are required."
+                ),
+                delete_after=8
+            )
+            continue
+
+        category = resolve_category(guild, category_raw)
+        if not category:
+            await channel.send(
+                embed=setup_embed(
+                    data,
+                    "Invalid Category",
+                    "Could not find that category. Use exact category name or category ID."
+                ),
+                delete_after=8
+            )
+            continue
+
+        return name, category.id
+
+
+async def run_setup_wizard(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    guild = interaction.guild
+    user = interaction.user
+    channel = interaction.channel
+
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.followup.send(
+            embed=base_embed(
+                guild.id,
+                "Setup Failed",
+                "Setup must be run in a text channel.",
+                error=True
+            ),
+            ephemeral=True
+        )
+        return
+
+    data = SetupData(guild.id, user.id, channel.id)
+    setup_sessions[(guild.id, user.id)] = data
+
+    try:
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Ticket Setup Started",
+                "I will ask you one question at a time.\n\n"
+                "Reply in this channel.\n"
+                "Type `cancel` anytime to stop the setup."
+            )
+        )
+
+        data.title = await ask_text(
+            channel, user, data,
+            "Title",
+            "Send the ticket panel title."
+        )
+
+        data.description = await ask_text(
+            channel, user, data,
+            "Description",
+            "Send the ticket panel description.",
+            multiline=True
+        )
+
+        color_raw = await ask_text(
+            channel, user, data,
+            "Embed Color",
+            "Send the embed hex color.\nExample: `#00FF66`\n\nType `skip` to use the default color.",
+            optional=True
+        )
+        if color_raw:
+            try:
+                data.color_hex = normalize_hex(color_raw)
+            except ValueError:
+                await channel.send(
+                    embed=base_embed(
+                        None,
+                        "Invalid Color",
+                        "Invalid hex color. Default color `#00FF66` will be used.",
+                        error=True
+                    ),
+                    delete_after=8
+                )
+                data.color_hex = "#00FF66"
+
+        panel_channel = await ask_text_channel(
+            channel, user, data, guild,
+            "Panel Channel",
+            "Send the panel channel mention, channel ID, or exact channel name."
+        )
+        data.panel_channel_id = panel_channel.id
+
+        support_role = await ask_role(
+            channel, user, data, guild,
+            "Support Team Role",
+            "Send the support role mention, role ID, or exact role name."
+        )
+        data.support_role_id = support_role.id
+
+        data.option_1_name, data.option_1_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 1, optional=False
+        )
+
+        data.option_2_name, data.option_2_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 2, optional=True
+        )
+
+        data.option_3_name, data.option_3_category_id = await ask_option_name_and_category(
+            channel, user, data, guild, 3, optional=True
+        )
+
+        log_channel = await ask_text_channel(
+            channel, user, data, guild,
+            "Log Channel",
+            "Send the log channel mention, channel ID, or exact channel name."
+        )
+        data.log_channel_id = log_channel.id
+
+        data.banner_url = await ask_image(
+            channel, user, data,
+            "Banner",
+            "Reply with the banner image uploaded as an attachment."
+        )
+
+        data.thumbnail_url = await ask_image(
+            channel, user, data,
+            "Small Picture",
+            "Reply with the small picture image uploaded as an attachment."
+        )
+
+        preview_message = await channel.send(
+            embed=build_setup_preview_embed(guild, data),
+            view=SetupConfirmView(data)
+        )
+
+        setup_sessions[(guild.id, user.id)] = data
+
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Setup Ready",
+                "Review the preview above and click **Publish** or **Cancel**."
+            ),
+            delete_after=20
+        )
+
+    except SetupCancelled:
+        await channel.send(
+            embed=setup_embed(
+                data,
+                "Setup Cancelled",
+                "The ticket setup was cancelled."
+            )
+        )
+        cleanup_setup(guild.id, user.id)
+
+    except Exception as e:
+        await channel.send(
+            embed=base_embed(
+                guild.id,
+                "Setup Failed",
+                f"An error happened during setup:\n`{e}`",
+                error=True
+            )
+        )
+        cleanup_setup(guild.id, user.id)
+
+
+def cleanup_setup(guild_id: int, user_id: int):
+    active_setup_guilds.discard(guild_id)
+    active_setup_users.discard((guild_id, user_id))
+    setup_sessions.pop((guild_id, user_id), None)
+
+
+# =========================
+# SETUP CONFIRM VIEW
+# =========================
+class SetupConfirmView(discord.ui.View):
+    def __init__(self, data: SetupData):
+        super().__init__(timeout=900)
+        self.data = data
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.data.user_id:
+            await interaction.response.send_message(
+                embed=base_embed(
+                    interaction.guild.id if interaction.guild else None,
+                    "Access Denied",
+                    "This setup is not yours.",
+                    error=True
                 ),
                 ephemeral=True
             )
+            return False
+        return True
 
-        ok = set_rank_to_role(self.target_user_id, selected_role_id)
+    @discord.ui.button(label="Publish", style=discord.ButtonStyle.success)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return
 
-        if not ok:
-            await send_log(
-                self.ctx.guild,
-                "/rank FAILED",
-                f"Admin: {self.ctx.author} ({self.ctx.author.id})\nTarget: {self.target_username}\nRoblox ID: {self.target_user_id}\nRequested rank: {selected_role_name} ({selected_role_id})\nReason: Rank API failed",
-                FAIL_COLOR
-            )
-            return await interaction.response.send_message(
-                embed=embed("Rank Failed", "Could not set that Roblox rank.", FAIL_COLOR),
+        data = self.data
+        guild = interaction.guild
+
+        clear_ticket_options(guild.id)
+        save_ticket_option(guild.id, 1, data.option_1_name, data.option_1_category_id)
+
+        if data.option_2_name and data.option_2_category_id:
+            save_ticket_option(guild.id, 2, data.option_2_name, data.option_2_category_id)
+
+        if data.option_3_name and data.option_3_category_id:
+            save_ticket_option(guild.id, 3, data.option_3_name, data.option_3_category_id)
+
+        panel_channel = guild.get_channel(data.panel_channel_id)
+        if not isinstance(panel_channel, discord.TextChannel):
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Publish Failed", "Panel channel is invalid.", error=True),
                 ephemeral=True
             )
+            return
 
-        if self.target_discord_id is not None:
-            save_member_state(self.target_discord_id, self.target_user_id, True, True, True, "ranked")
+        embed = discord.Embed(
+            title=data.title,
+            description=data.description,
+            color=hex_to_color(data.color_hex)
+        )
+        embed.set_thumbnail(url=data.thumbnail_url)
+        embed.set_image(url=data.banner_url)
+        embed.set_footer(text="made by @fntsheetz")
 
-        delete_manual_demote(self.target_user_id)
-        delete_temp_demote(self.target_user_id)
+        panel_message = await panel_channel.send(
+            embed=embed,
+            view=TicketPanelView(guild.id)
+        )
+
+        save_guild_config(
+            guild_id=guild.id,
+            panel_channel_id=data.panel_channel_id,
+            panel_message_id=panel_message.id,
+            title=data.title,
+            description=data.description,
+            color_hex=data.color_hex,
+            banner_url=data.banner_url,
+            thumbnail_url=data.thumbnail_url,
+            support_role_id=data.support_role_id,
+            log_channel_id=data.log_channel_id
+        )
+
+        bot.add_view(TicketPanelView(guild.id), message_id=panel_message.id)
+
+        await interaction.response.edit_message(
+            embed=base_embed(
+                guild.id,
+                "Setup Complete",
+                f"Ticket panel created in {panel_channel.mention}."
+            ),
+            view=None
+        )
+
+        cleanup_setup(guild.id, interaction.user.id)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=base_embed(
+                interaction.guild.id if interaction.guild else None,
+                "Setup Cancelled",
+                "The setup was cancelled."
+            ),
+            view=None
+        )
+        if interaction.guild:
+            cleanup_setup(interaction.guild.id, interaction.user.id)
+
+
+# =========================
+# PANEL VIEW
+# =========================
+class TicketDropdown(discord.ui.Select):
+    def __init__(self, guild_id: int):
+        rows = get_ticket_options(guild_id)
+        options = [
+            discord.SelectOption(label=row["label"][:100], value=str(row["option_index"]))
+            for row in rows
+        ]
+
+        super().__init__(
+            placeholder="Make a selection",
+            min_values=1,
+            max_values=1,
+            options=options,
+            custom_id=f"ticket_dropdown:{guild_id}"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        guild = interaction.guild
+        opener = interaction.user
+        config = get_guild_config(guild.id)
+
+        if not config:
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Error", "Ticket system is not configured.", error=True),
+                ephemeral=True
+            )
+            return
+
+        existing = get_open_ticket_for_user(guild.id, opener.id)
+        if existing:
+            existing_channel = guild.get_channel(existing["channel_id"])
+            if existing_channel:
+                await interaction.response.send_message(
+                    embed=base_embed(
+                        guild.id,
+                        "Open Ticket Found",
+                        f"You already have an open ticket: {existing_channel.mention}"
+                    ),
+                    ephemeral=True
+                )
+                return
+
+        selected_index = int(self.values[0])
+        rows = get_ticket_options(guild.id)
+        selected = next((r for r in rows if r["option_index"] == selected_index), None)
+
+        if not selected:
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Error", "That ticket option is no longer configured.", error=True),
+                ephemeral=True
+            )
+            return
+
+        category = guild.get_channel(selected["category_id"])
+        if not isinstance(category, discord.CategoryChannel):
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Error", "The configured category is invalid.", error=True),
+                ephemeral=True
+            )
+            return
+
+        support_role = guild.get_role(config["support_role_id"])
+        if not support_role:
+            await interaction.response.send_message(
+                embed=base_embed(guild.id, "Error", "The support role is invalid.", error=True),
+                ephemeral=True
+            )
+            return
+
+        channel_name = clean_channel_name(f"{selected['label']}-{opener.name}")
+
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            opener: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True
+            ),
+            support_role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_messages=True
+            ),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                attach_files=True,
+                embed_links=True,
+                manage_channels=True,
+                manage_messages=True
+            )
+        }
+
+        try:
+            ticket_channel = await guild.create_text_channel(
+                name=channel_name,
+                category=category,
+                overwrites=overwrites,
+                reason=f"Ticket created by {opener} ({opener.id})"
+            )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=base_embed(
+                    guild.id,
+                    "Error",
+                    "I do not have permission to create channels in that category.",
+                    error=True
+                ),
+                ephemeral=True
+            )
+            return
+
+        create_ticket_record(ticket_channel.id, guild.id, opener.id, selected["label"])
+
+        await ticket_channel.send(
+            content=f"{support_role.mention} {opener.mention}",
+            embed=build_ticket_embed(guild.id, selected["label"], opener),
+            view=TicketControlsView()
+        )
 
         await send_log(
-            self.ctx.guild,
-            "/rank SUCCESS",
-            f"Admin: {self.ctx.author} ({self.ctx.author.id})\nTarget: {self.target_username}\nRoblox ID: {self.target_user_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {selected_role_name} ({selected_role_id})",
-            SUCCESS_COLOR
-        )
-
-        if self.target_discord_id is not None:
-            await dm_by_discord_id(
-                self.target_discord_id,
-                embed(
-                    "Your Roblox Group Rank Was Updated",
-                    f"You have been ranked to: {selected_role_name}.",
-                    SUCCESS_COLOR
-                )
+            guild,
+            "Ticket Opened",
+            (
+                f"User: {opener.mention}\n"
+                f"Channel: {ticket_channel.mention}\n"
+                f"Type: {selected['label']}"
             )
+        )
 
         await interaction.response.send_message(
-            embed=embed(
-                "Rank Updated",
-                f"{self.target_username} has been ranked to {selected_role_name}.",
-                SUCCESS_COLOR
+            embed=base_embed(guild.id, "Ticket Created", f"Your ticket has been created: {ticket_channel.mention}"),
+            ephemeral=True
+        )
+
+
+class TicketPanelView(discord.ui.View):
+    def __init__(self, guild_id: int):
+        super().__init__(timeout=None)
+        self.add_item(TicketDropdown(guild_id))
+
+
+# =========================
+# TICKET BUTTONS
+# =========================
+class ClaimTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Claim Ticket",
+            style=discord.ButtonStyle.secondary,
+            custom_id="ticket_claim_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can claim tickets.", error=True),
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                ephemeral=True
+            )
+            return
+
+        if ticket["claimed_by"] == interaction.user.id:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Already Claimed", "You already claimed this ticket."),
+                ephemeral=True
+            )
+            return
+
+        set_ticket_claimed(interaction.channel.id, interaction.user.id)
+
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Ticket Claimed", f"Ticket claimed by {interaction.user.mention}.")
+        )
+
+        await send_log(
+            interaction.guild,
+            "Ticket Claimed",
+            f"Channel: {interaction.channel.mention}\nClaimed by: {interaction.user.mention}"
+        )
+
+
+class CloseTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Close Ticket",
+            style=discord.ButtonStyle.danger,
+            custom_id="ticket_close_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can close tickets.", error=True),
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                ephemeral=True
+            )
+            return
+
+        if ticket["status"] == "closed":
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Already Closed", "This ticket is already closed."),
+                ephemeral=True
+            )
+            return
+
+        config = get_guild_config(interaction.guild.id)
+        support_role = interaction.guild.get_role(config["support_role_id"]) if config else None
+
+        try:
+            await interaction.channel.set_permissions(
+                discord.Object(id=ticket["opener_id"]),
+                view_channel=False
+            )
+
+            if support_role:
+                await interaction.channel.set_permissions(
+                    support_role,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    attach_files=True,
+                    embed_links=True,
+                    manage_messages=True
+                )
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Error", "I do not have permission to update channel permissions.", error=True),
+                ephemeral=True
+            )
+            return
+
+        close_ticket_record(interaction.channel.id)
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=build_closed_ticket_embed(interaction.guild.id, interaction.user),
+            view=TicketControlsView()
+        )
+
+        await send_log(
+            interaction.guild,
+            "Ticket Closed",
+            f"Channel: #{interaction.channel.name}\nClosed by: {interaction.user.mention}"
+        )
+
+
+class DeleteTicketButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Delete Ticket",
+            style=discord.ButtonStyle.danger,
+            custom_id="ticket_delete_button"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return
+
+        if not isinstance(interaction.channel, discord.TextChannel):
+            return
+
+        if not is_support_or_admin(interaction.user, interaction.guild.id):
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can delete tickets.", error=True),
+                ephemeral=True
+            )
+            return
+
+        ticket = get_ticket_by_channel(interaction.channel.id)
+        if not ticket:
+            await interaction.response.send_message(
+                embed=base_embed(interaction.guild.id, "Error", "This is not a tracked ticket channel.", error=True),
+                ephemeral=True
+            )
+            return
+
+        transcript_text = await build_transcript_text(interaction.channel)
+        transcript_bytes = transcript_text.encode("utf-8", errors="ignore")
+        transcript_file = discord.File(
+            io.BytesIO(transcript_bytes),
+            filename=f"transcript-{interaction.channel.name}.txt"
+        )
+
+        opener_text = f"<@{ticket['opener_id']}>"
+
+        await send_log(
+            interaction.guild,
+            "Ticket Deleted",
+            (
+                f"Channel: #{interaction.channel.name}\n"
+                f"Opened by: {opener_text}\n"
+                f"Type: {ticket['option_label']}\n"
+                f"Deleted by: {interaction.user.mention}"
             ),
-            ephemeral=False
+            file=transcript_file
         )
 
-class RankView(discord.ui.View):
-    def __init__(self, ctx, target_username, target_user_id, target_discord_id, roles):
-        super().__init__(timeout=120)
-        self.add_item(RankSelect(ctx, target_username, target_user_id, target_discord_id, roles))
+        delete_ticket_record(interaction.channel.id)
 
-# ---------------- /turfapply ----------------
-@bot.slash_command(name="turfapply")
-async def turfapply(ctx, username: str):
-    await ctx.defer()
-    member = ctx.author
-
-    if not has_role(member, ALLOWED_ROLE_ID):
-        await log_command(
-            ctx,
-            "/turfapply DENIED",
-            f"User: {member} ({member.id})\nUsername: {username}\nReason: Missing role",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Access Denied", "Missing role.", FAIL_COLOR))
-
-    if has_applied(member.id):
-        await log_command(
-            ctx,
-            "/turfapply BLOCKED",
-            f"User: {member} ({member.id})\nUsername: {username}\nReason: Already applied",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Already Applied", "You already applied.", FAIL_COLOR))
-
-    user_id = get_user_id(username)
-    if not user_id:
-        await log_command(
-            ctx,
-            "/turfapply FAILED",
-            f"User: {member} ({member.id})\nUsername: {username}\nReason: Invalid Roblox username",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("User Not Found", "Invalid Roblox username.", FAIL_COLOR))
-
-    profile = get_user_profile(user_id)
-    if not profile:
-        await log_command(
-            ctx,
-            "/turfapply FAILED",
-            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Could not fetch profile",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Error", "Could not fetch profile.", FAIL_COLOR))
-
-    if not display_name_ok(profile):
-        await log_command(
-            ctx,
-            "/turfapply FAILED",
-            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Display name missing '{DISPLAY_REQUIRED_TEXT}'",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Invalid Display Name", f"Your Roblox display must contain '{DISPLAY_REQUIRED_TEXT}'.", FAIL_COLOR))
-
-    if not is_in_group(user_id):
-        await log_command(
-            ctx,
-            "/turfapply FAILED",
-            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Not in Roblox group",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Not In Group", "You must be in the Roblox group.", FAIL_COLOR))
-
-    current_role_id = get_user_rank_in_group(user_id)
-    current_role_name = get_user_role_name_in_group(user_id)
-
-    if current_role_id == RANK_ID:
-        await log_command(
-            ctx,
-            "/turfapply ALREADY RANKED",
-            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name} ({current_role_id})",
-            SUCCESS_COLOR
-        )
-        return await ctx.respond(
-            embed=embed("Already Ranked", f"You are already ranked as {current_role_name}.", SUCCESS_COLOR)
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Deleting Ticket", "The ticket is being deleted.")
         )
 
-    if current_role_id is not None and current_role_id != RANK_ID:
-        group_roles = get_group_roles()
-        target_role_data = next((r for r in group_roles if int(r["id"]) == int(RANK_ID)), None)
-        current_role_data = next((r for r in group_roles if int(r["id"]) == int(current_role_id)), None)
+        try:
+            await interaction.channel.delete(reason=f"Ticket deleted by {interaction.user}")
+        except discord.Forbidden:
+            pass
 
-        if current_role_data and target_role_data:
-            if int(current_role_data.get("rank", 0)) > int(target_role_data.get("rank", 0)):
-                await log_command(
-                    ctx,
-                    "/turfapply HIGHER RANK",
-                    f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name} ({current_role_id})",
-                    SUCCESS_COLOR
-                )
-                return await ctx.respond(
-                    embed=embed("Already Higher Rank", f"You already have a higher rank: {current_role_name}.", SUCCESS_COLOR)
-                )
 
-    if set_rank(user_id):
-        save_application(member.id, user_id)
-        user_links[member.id] = user_id
-        save_member_state(member.id, user_id, True, True, True, "ranked")
+class TicketControlsView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(ClaimTicketButton())
+        self.add_item(CloseTicketButton())
+        self.add_item(DeleteTicketButton())
 
-        await ctx.respond(embed=embed("Accepted", f"You have been ranked as {RANK_NAME}!", SUCCESS_COLOR))
 
-        await log_command(
-            ctx,
-            "/turfapply SUCCESS",
-            f"User: {member} ({member.id})\nRoblox Username: {username}\nRoblox ID: {user_id}",
-            SUCCESS_COLOR
+# =========================
+# COMMANDS
+# =========================
+@bot.tree.command(name="setup", description="Start the guided ticket setup")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def setup(interaction: discord.Interaction):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            embed=base_embed(None, "Access Denied", "Only users with Administrator can use this command.", error=True),
+            ephemeral=True
         )
+        return
 
-        await send_dm(
-            member,
-            embed(
-                "Welcome To The Turf",
-                f"You have been accepted and ranked as {RANK_NAME}.",
-                SUCCESS_COLOR
-            )
+    if interaction.guild.id in active_setup_guilds:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Setup Running", "A setup is already running in this server."),
+            ephemeral=True
         )
-    else:
-        await log_command(
-            ctx,
-            "/turfapply FAILED",
-            f"User: {member} ({member.id})\nUsername: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            FAIL_COLOR
-        )
-        await ctx.respond(embed=embed("Rank Failed", "Could not set Roblox rank. Try again later.", FAIL_COLOR))
+        return
 
-# ---------------- /demote ----------------
-@bot.slash_command(name="demote")
-async def demote(ctx, username: str, reason: str):
-    await ctx.defer()
-    admin = ctx.author
+    active_setup_guilds.add(interaction.guild.id)
+    active_setup_users.add((interaction.guild.id, interaction.user.id))
 
-    if not has_role(admin, DEMOTE_ROLE_ID):
-        await log_command(
-            ctx,
-            "/demote DENIED",
-            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR))
-
-    user_id = get_user_id(username)
-    if not user_id:
-        await log_command(
-            ctx,
-            "/demote FAILED",
-            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("User Not Found", "Invalid username.", FAIL_COLOR))
-
-    discord_id = get_discord_id_by_roblox(user_id)
-    current_role_id = get_user_rank_in_group(user_id)
-    current_role_name = get_user_role_name_in_group(user_id)
-    target_role_name = get_group_role_name_by_id(DEMOTE_RANK_ID)
-
-    if current_role_id == DEMOTE_RANK_ID:
-        await log_command(
-            ctx,
-            "/demote SKIPPED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Already demoted rank ({target_role_name})",
-            SUCCESS_COLOR
-        )
-        return await ctx.respond(
-            embed=embed("Already Demoted", f"{username} is already {target_role_name}.", SUCCESS_COLOR)
-        )
-
-    if rank_down(user_id):
-        delete_temp_demote(user_id)
-        save_manual_demote(discord_id, user_id, username, reason, admin.id)
-
-        if discord_id is not None:
-            save_member_state(discord_id, user_id, True, True, True, "manual_demoted")
-
-        await ctx.respond(embed=embed("Demoted", f"{username}\nReason: {reason}", SUCCESS_COLOR))
-
-        await log_command(
-            ctx,
-            "/demote SUCCESS",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {target_role_name} ({DEMOTE_RANK_ID})\nReason: {reason}",
-            SUCCESS_COLOR
-        )
-
-        if discord_id is not None:
-            await dm_by_discord_id(
-                discord_id,
-                embed(
-                    "You Have Been Permanently Demoted",
-                    f"You have been demoted from The Turf.\n\nReason: {reason}\nDuration: Permanent",
-                    FAIL_COLOR
-                )
-            )
-    else:
-        await log_command(
-            ctx,
-            "/demote FAILED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            FAIL_COLOR
-        )
-        await ctx.respond(embed=embed("Demote Failed", "Could not change Roblox rank.", FAIL_COLOR))
-
-# ---------------- /tempdemote ----------------
-@bot.slash_command(name="tempdemote")
-async def tempdemote(ctx, username: str, duration: str, reason: str):
-    await ctx.defer()
-    admin = ctx.author
-
-    if not has_role(admin, DEMOTE_ROLE_ID):
-        await log_command(
-            ctx,
-            "/tempdemote DENIED",
-            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Missing permission role",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR))
-
-    delta = parse_duration(duration)
-    if delta is None:
-        await log_command(
-            ctx,
-            "/tempdemote FAILED",
-            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid duration '{duration}'",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Invalid Duration", "Use for example: 1min, 5min, 1h, 12h, 1d", FAIL_COLOR))
-
-    user_id = get_user_id(username)
-    if not user_id:
-        await log_command(
-            ctx,
-            "/tempdemote FAILED",
-            f"Admin: {admin} ({admin.id})\nUsername: {username}\nReason: Invalid username",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("User Not Found", "Invalid username.", FAIL_COLOR))
-
-    discord_id = get_discord_id_by_roblox(user_id)
-    expires_at = datetime.now(timezone.utc) + delta
-    current_role_id = get_user_rank_in_group(user_id)
-    current_role_name = get_user_role_name_in_group(user_id)
-    target_role_name = get_group_role_name_by_id(DEMOTE_RANK_ID)
-
-    if current_role_id == DEMOTE_RANK_ID:
-        save_temp_demote(discord_id, user_id, username, reason, duration, expires_at, admin.id)
-
-        await log_command(
-            ctx,
-            "/tempdemote UPDATED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Already on demoted rank, timer updated\nDuration: {duration}\nExpires: {format_dt(expires_at)}",
-            SUCCESS_COLOR
-        )
-
-        if discord_id is not None:
-            await dm_by_discord_id(
-                discord_id,
-                embed(
-                    "Temporary Demotion Updated",
-                    f"Your temporary demotion timer has been updated.\n\nReason: {reason}\nDuration: {duration}\nEnds: {format_dt(expires_at)}",
-                    SUCCESS_COLOR
-                )
-            )
-
-        return await ctx.respond(
-            embed=embed("Temp Demotion Updated", f"{username} was already demoted. Timer updated to {duration}.", SUCCESS_COLOR)
-        )
-
-    if rank_down(user_id):
-        save_temp_demote(discord_id, user_id, username, reason, duration, expires_at, admin.id)
-
-        if discord_id is not None:
-            save_member_state(discord_id, user_id, True, True, True, "temp_demoted")
-
-        await ctx.respond(embed=embed("Temp Demoted", f"{username}\nDuration: {duration}\nReason: {reason}", SUCCESS_COLOR))
-
-        await log_command(
-            ctx,
-            "/tempdemote SUCCESS",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nDiscord ID: {discord_id}\nOld role: {current_role_name} ({current_role_id})\nNew role: {target_role_name} ({DEMOTE_RANK_ID})\nDuration: {duration}\nExpires: {format_dt(expires_at)}\nReason: {reason}",
-            SUCCESS_COLOR
-        )
-
-        if discord_id is not None:
-            await dm_by_discord_id(
-                discord_id,
-                embed(
-                    "You Have Been Temporarily Demoted",
-                    f"You have been temporarily demoted from The Turf.\n\nReason: {reason}\nDuration: {duration}\nEnds: {format_dt(expires_at)}",
-                    FAIL_COLOR
-                )
-            )
-    else:
-        await log_command(
-            ctx,
-            "/tempdemote FAILED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Rank API failed",
-            FAIL_COLOR
-        )
-        await ctx.respond(embed=embed("Temp Demote Failed", "Could not change Roblox rank.", FAIL_COLOR))
-
-# ---------------- /rank ----------------
-@bot.slash_command(name="rank")
-async def rank(ctx, username: str):
-    await ctx.defer(ephemeral=True)
-    admin = ctx.author
-
-    if not has_role(admin, DEMOTE_ROLE_ID):
-        await log_command(
-            ctx,
-            "/rank DENIED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: Missing permission role",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("No Permission", "Missing role.", FAIL_COLOR), ephemeral=True)
-
-    user_id = get_user_id(username)
-    if not user_id:
-        await log_command(
-            ctx,
-            "/rank FAILED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nReason: Invalid Roblox username",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("User Not Found", "Invalid Roblox username.", FAIL_COLOR), ephemeral=True)
-
-    if not is_in_group(user_id):
-        await log_command(
-            ctx,
-            "/rank FAILED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: User not in Roblox group",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Not In Group", "That user is not in the Roblox group.", FAIL_COLOR), ephemeral=True)
-
-    roles = get_group_roles()
-    if not roles:
-        await log_command(
-            ctx,
-            "/rank FAILED",
-            f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nReason: Could not fetch group roles",
-            FAIL_COLOR
-        )
-        return await ctx.respond(embed=embed("Error", "Could not fetch group ranks.", FAIL_COLOR), ephemeral=True)
-
-    roles_sorted = sorted(roles, key=lambda r: int(r.get("rank", 0)), reverse=True)
-    discord_id = get_discord_id_by_roblox(user_id)
-    current_role_name = get_user_role_name_in_group(user_id)
-
-    await log_command(
-        ctx,
-        "/rank OPENED",
-        f"Admin: {admin} ({admin.id})\nTarget: {username}\nRoblox ID: {user_id}\nCurrent role: {current_role_name}",
-        SUCCESS_COLOR
-    )
-
-    await ctx.respond(
-        embed=embed(
-            "Select Rank",
-            f"Choose a new Roblox rank for {username}.\nCurrent role: {current_role_name}",
-            SUCCESS_COLOR
+    await interaction.response.send_message(
+        embed=base_embed(
+            interaction.guild.id,
+            "Setup Started",
+            "The guided setup has started in this channel."
         ),
-        view=RankView(ctx, username, user_id, discord_id, roles_sorted),
         ephemeral=True
     )
 
-# ---------------- TEMP DEMOTE EXPIRY ----------------
-async def process_expired_temp_demotions():
-    expired = get_expired_temp_demotions()
-    if not expired:
+    await run_setup_wizard(interaction)
+
+
+@bot.tree.command(name="remind", description="DM a user to reply in their ticket")
+@app_commands.guild_only()
+async def remind(
+    interaction: discord.Interaction,
+    user: discord.Member,
+    message: str
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
         return
 
-    for item in expired:
-        roblox_id = int(item["roblox_id"])
-        discord_id = item["discord_id"]
-        username = item["username"]
-        reason = item["reason"]
-        duration_text = item["duration_text"]
-
-        guild = None
-        member = None
-
-        if discord_id is not None:
-            guild, member = get_member_from_any_guild(int(discord_id))
-
-        profile = get_user_profile(roblox_id)
-        display_ok = display_name_ok(profile)
-        group_ok = is_in_group(roblox_id)
-        has_role_flag = member is not None and has_role(member, ALLOWED_ROLE_ID)
-        blocked = is_manual_demoted(roblox_id)
-
-        if not blocked and has_role_flag and display_ok and group_ok and set_rank(roblox_id):
-            if guild:
-                await send_log(
-                    guild,
-                    "TEMP DEMOTE ENDED",
-                    f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nOriginal reason: {reason}\nOriginal duration: {duration_text}",
-                    SUCCESS_COLOR
-                )
-
-            if discord_id is not None:
-                await dm_by_discord_id(
-                    int(discord_id),
-                    embed(
-                        "Temp Demotion Ended",
-                        f"Your temporary demotion has ended and your access has been restored.\n\nPrevious reason: {reason}\nPrevious duration: {duration_text}",
-                        SUCCESS_COLOR
-                    )
-                )
-
-            if discord_id is not None:
-                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
-        else:
-            if guild:
-                await send_log(
-                    guild,
-                    "TEMP DEMOTE ENDED - NO RE-RANK",
-                    f"Target: {username}\nRoblox ID: {roblox_id}\nDiscord ID: {discord_id}\nBlocked manual demote: {blocked}\nHas role: {has_role_flag}\nDisplay ok: {display_ok}\nGroup ok: {group_ok}",
-                    FAIL_COLOR
-                )
-
-            if discord_id is not None:
-                await dm_by_discord_id(
-                    int(discord_id),
-                    embed(
-                        "Temp Demotion Ended - Access Not Restored",
-                        "Your temporary demotion has ended, but your access was not restored because one or more requirements are not currently met.",
-                        FAIL_COLOR
-                    )
-                )
-
-            if discord_id is not None:
-                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "deranked")
-
-        delete_temp_demote(roblox_id)
-
-@tasks.loop(minutes=1)
-async def temp_demote_checker():
-    await process_expired_temp_demotions()
-
-# ---------------- MEMBER STATUS CHECKER ----------------
-async def evaluate_member_access(discord_id, roblox_id):
-    guild, member = get_member_from_any_guild(int(discord_id))
-    if guild is None or member is None:
+    if not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Error", "This command must be used inside a ticket channel.", error=True),
+            ephemeral=True
+        )
         return
 
-    profile = get_user_profile(roblox_id)
-    has_role_flag = has_role(member, ALLOWED_ROLE_ID)
-    display_ok = display_name_ok(profile)
-    group_ok = is_in_group(roblox_id)
-
-    prev = get_member_state(int(discord_id))
-    prev_rank_state = prev["last_rank_state"] if prev else "unknown"
-    prev_has_role = prev["last_has_role"] if prev else None
-    prev_display_ok = prev["last_display_ok"] if prev else None
-
-    blocked_manual = is_manual_demoted(roblox_id)
-    blocked_temp = get_temp_demote(roblox_id) is not None
-
-    eligible_for_rank = has_role_flag and display_ok and group_ok and not blocked_manual and not blocked_temp
-
-    if eligible_for_rank:
-        if prev_rank_state != "ranked":
-            restored_reason = "Your access has been restored because your requirements are valid again."
-            if prev_has_role is False and prev_display_ok is False:
-                restored_reason = "Your access has been restored because your Discord role is back and your Roblox display name now includes 'fl13' again."
-            elif prev_has_role is False:
-                restored_reason = "Your access has been restored because your required Discord role is back."
-            elif prev_display_ok is False:
-                restored_reason = "Your access has been restored because your Roblox display name now includes 'fl13' again."
-
-            if set_rank(roblox_id):
-                await send_log(
-                    guild,
-                    "AUTO RE-RANK",
-                    f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Role/display/group requirements restored",
-                    SUCCESS_COLOR
-                )
-                await send_dm(
-                    member,
-                    embed(
-                        "Your Access Has Been Restored",
-                        restored_reason,
-                        SUCCESS_COLOR
-                    )
-                )
-                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
-                return
-            else:
-                await send_log(
-                    guild,
-                    "AUTO RE-RANK FAILED",
-                    f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: Rank API failed",
-                    FAIL_COLOR
-                )
-                save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "deranked")
-                return
-
-        save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, "ranked")
+    if not is_support_or_admin(interaction.user, interaction.guild.id):
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Access Denied", "Only the support team or admins can use this command.", error=True),
+            ephemeral=True
+        )
         return
 
-    if prev_rank_state != "deranked" and prev_rank_state != "manual_demoted" and prev_rank_state != "temp_demoted":
-        if rank_down(roblox_id):
-            reason_parts = []
-            if not has_role_flag:
-                reason_parts.append("required Discord role missing")
-            if not display_ok:
-                reason_parts.append(f"Roblox display name missing '{DISPLAY_REQUIRED_TEXT}'")
-            if not group_ok:
-                reason_parts.append("not in Roblox group")
-            if blocked_manual:
-                reason_parts.append("manually demoted")
-            if blocked_temp:
-                reason_parts.append("temporary demotion active")
+    ticket = get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Error", "This command can only be used inside a ticket channel.", error=True),
+            ephemeral=True
+        )
+        return
 
-            reason_text = ", ".join(reason_parts) if reason_parts else "requirements not met"
+    if ticket["opener_id"] != user.id:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Error", "That user is not the opener of this ticket.", error=True),
+            ephemeral=True
+        )
+        return
 
-            await send_log(
-                guild,
-                "AUTO DERANK",
-                f"Member: {member} ({member.id})\nRoblox ID: {roblox_id}\nReason: {reason_text}",
-                FAIL_COLOR
-            )
+    config = get_guild_config(interaction.guild.id)
+    dm_embed = discord.Embed(
+        title="Ticket Reminder",
+        description=(
+            f"You have an open ticket in **{interaction.guild.name}**.\n\n"
+            f"Message from support:\n{message}\n\n"
+            f"Ticket channel: #{interaction.channel.name}"
+        ),
+        color=hex_to_color(config["color_hex"])
+    )
+    dm_embed.set_footer(text="made by @fntsheetz")
 
-            if not blocked_manual and not blocked_temp:
-                dm_reason = "You have been demoted from Turf because your requirements are no longer valid."
-                if not has_role_flag and not display_ok:
-                    dm_reason = "You have been demoted from Turf because you lost the required Discord role and your Roblox display name no longer includes 'fl13'."
-                elif not has_role_flag:
-                    dm_reason = "You have been demoted from Turf because you no longer have the required Discord role."
-                elif not display_ok:
-                    dm_reason = "You have been demoted from Turf because your Roblox display name no longer includes 'fl13'."
-                elif not group_ok:
-                    dm_reason = "You have been demoted from Turf because you are no longer in the Roblox group."
+    try:
+        await user.send(embed=dm_embed)
+    except discord.Forbidden:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "DM Failed", "I could not DM that user.", error=True),
+            ephemeral=True
+        )
+        return
 
-                await send_dm(
-                    member,
-                    embed(
-                        "You Have Been Demoted From Turf",
-                        dm_reason,
-                        FAIL_COLOR
-                    )
-                )
+    await interaction.response.send_message(
+        embed=base_embed(interaction.guild.id, "Reminder Sent", f"Reminder sent to {user.mention}."),
+        ephemeral=True
+    )
 
-    new_state = "deranked"
-    if blocked_manual:
-        new_state = "manual_demoted"
-    elif blocked_temp:
-        new_state = "temp_demoted"
+    await send_log(
+        interaction.guild,
+        "Ticket Reminder Sent",
+        (
+            f"Channel: {interaction.channel.mention}\n"
+            f"To: {user.mention}\n"
+            f"By: {interaction.user.mention}\n"
+            f"Message: {message}"
+        )
+    )
 
-    save_member_state(int(discord_id), roblox_id, has_role_flag, display_ok, group_ok, new_state)
 
-@tasks.loop(minutes=2)
-async def member_status_checker():
-    apps = get_all_applications()
-    for item in apps:
-        discord_id = int(item["discord_id"])
-        roblox_id = int(item["roblox_id"])
-        try:
-            await evaluate_member_access(discord_id, roblox_id)
-        except Exception as e:
-            print(f"[STATUS CHECK ERROR] discord_id={discord_id}, roblox_id={roblox_id} -> {e}")
+@bot.tree.command(name="serverprofile", description="Change the bot nickname and avatar for this server")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def serverprofile(
+    interaction: discord.Interaction,
+    nickname: Optional[str] = None,
+    avatar: Optional[discord.Attachment] = None,
+):
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        return
 
-# ---------------- MEMBER UPDATE EVENT ----------------
-@bot.event
-async def on_member_update(before, after):
-    before_roles = [r.id for r in before.roles]
-    after_roles = [r.id for r in after.roles]
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            embed=base_embed(None, "Access Denied", "Only users with Administrator can use this command.", error=True),
+            ephemeral=True
+        )
+        return
 
-    if (ALLOWED_ROLE_ID in before_roles) != (ALLOWED_ROLE_ID in after_roles):
-        roblox_id = get_cached_or_db_roblox_id(after.id)
-        if roblox_id:
-            try:
-                await evaluate_member_access(after.id, roblox_id)
-            except Exception as e:
-                print(f"[on_member_update ERROR] {after.id} -> {e}")
+    if avatar is not None and not is_image_attachment(avatar):
+        await interaction.response.send_message(
+            embed=base_embed(None, "Update Failed", "Avatar attachment must be an image.", error=True),
+            ephemeral=True
+        )
+        return
 
-# ---------------- READY ----------------
+    success, message = await set_guild_profile(
+        guild_id=interaction.guild.id,
+        nickname=nickname,
+        avatar_attachment=avatar
+    )
+
+    if success:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Server Profile Updated", "The bot profile was updated for this server."),
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            embed=base_embed(interaction.guild.id, "Update Failed", message, error=True),
+            ephemeral=True
+        )
+
+
+@setup.error
+async def setup_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if interaction.guild:
+        cleanup_setup(interaction.guild.id, interaction.user.id)
+
+    embed = base_embed(
+        interaction.guild.id if interaction.guild else None,
+        "Setup Failed",
+        f"{error}",
+        error=True
+    )
+
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@remind.error
+async def remind_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = base_embed(
+        interaction.guild.id if interaction.guild else None,
+        "Remind Failed",
+        f"{error}",
+        error=True
+    )
+
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@serverprofile.error
+async def serverprofile_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    embed = base_embed(
+        interaction.guild.id if interaction.guild else None,
+        "Update Failed",
+        f"{error}",
+        error=True
+    )
+
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# =========================
+# READY
+# =========================
 @bot.event
 async def on_ready():
+    init_db()
+
     try:
-        init_db()
-        load_user_links()
-
-        if not temp_demote_checker.is_running():
-            temp_demote_checker.start()
-
-        if not member_status_checker.is_running():
-            member_status_checker.start()
-
-        print(f"Bot online: {bot.user}")
-        print(f"Loaded {len(user_links)} user links from database.")
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} commands")
     except Exception as e:
-        print(f"Startup error: {e}")
+        print(f"Command sync failed: {e}")
 
-bot.run(DISCORD_TOKEN)
+    bot.add_view(TicketControlsView())
+
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("SELECT guild_id, panel_message_id FROM guild_config")
+    rows = cur.fetchall()
+    conn.close()
+
+    for row in rows:
+        try:
+            bot.add_view(TicketPanelView(row["guild_id"]), message_id=row["panel_message_id"])
+        except Exception as e:
+            print(f"Failed to restore panel view for guild {row['guild_id']}: {e}")
+
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+
+
+bot.run(TOKEN)
